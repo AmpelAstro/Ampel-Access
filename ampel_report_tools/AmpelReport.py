@@ -4,35 +4,29 @@
 # License:             BSD-3-Clause
 # Author:              jno
 # Date:                19.1.2026
-# Last Modified Date:  19.1.2026
-# Last Modified By:    jno
+# Last Modified Date:  10.2.2026
+# Last Modified By:    Felix Fischer
 
 """
 AmpelReport
 ===========
 
-Utilities for visualizing and summarizing AMPEL alert reports.
+Utilities for visualizing and summarizing individual AMPEL alert reports.
 
 This module provides:
 - Lightcurve plotting
 - Classification probability visualization
 - Host/environment information display
+- Finder stamp retrieval from CDS surveys
 
 The main entry point is the `AmpelTransientReport` class, which wraps
 an `LSSTReport` object from ampel-hu-astro.
 
-Dependencies
-------------
-numpy, pandas, matplotlib, astropy, pillow, ztfquery, ampel-hu-astro
-
-Notes
------
-Some helper functions are currently duplicated from AMPEL T3 PlotTransientLightcurves.
-LSSTReport should be imported without requiring the full AMPEL stack.
 """
 
 
-from typing import Optional
+from __future__ import annotations
+from typing import Optional, Any
 import io
 import requests
 
@@ -45,102 +39,85 @@ import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.pyplot import Figure
 from matplotlib.gridspec import GridSpec
-from PIL import Image
 
-### These are all methods from Ampel (mainly hu-astro).
-# Should prob move to an easy to import package. 
+from .LSSTReportModel import LSSTReport
 
-# Models loaded from ampel-hu-astro
-from ampel.contrib.hu.model.LSSTReport import (
-    Classification,
-    Feature,
-    Host,
-    LSSTReport,
-    Object,
-    PhotometricPoint,
-    LSSTReport
-)
 
-# Method largely grabbed from T3 PlotLightcurves 
+
 def get_finder_stamp(
     ra: float,
     dec: float,
     size: int = 240,
     surveys: list[str] | None = None,
     timeout: float = 8.0,
-    fov_arcsec: float = 8,
-):
+    fov_arcsec: float = 45.0,
+) -> tuple[np.ndarray | None, str | None]:
     """
-    RA, Dec in degrees.
-    Size in pixels (square).
+    Best-effort finder stamp: CDS hips2fits JPEG fallback
 
-    Best-effort finder stamp:
-    1) PS1 via get_ps_stamp (returns PIL image)
-    2) HiPS/hips2fits fallback as FITS -> we apply our own stretch
-    Returns (image_array, label) where image_array is 2D float array, or (None, None).
-
-    Returns
-    -------
-    image : np.ndarray | None
-        2D image or None on failure.
-    label : str | None
-        Survey label, or None on failure.
+    Returns (image_array, label). image_array is 2D float array or None.
     """
-
 
     if surveys is None:
         surveys = [
-            "CDS/P/Skymapper-color-IRG",
+            "CDS/P/DESI-Legacy-Surveys/DR10/color",
             "CDS/P/DECaLS/DR5/color",
+            "CDS/P/DES-DR2/ColorIRG",
+            "CDS/P/Skymapper/DR4/color",
             "CDS/P/DSS2/color",
         ]
 
-    LABELS = {
-        "CDS/P/Skymapper-color-IRG": "SkyMapper",
+    labels = {
+        "CDS/P/DESI-Legacy-Surveys/DR10/color": "DESI DR10",
+        "CDS/P/DES-DR2/ColorIRG": "DES",
+        "CDS/P/Skymapper/DR4/color": "SkyMapper",
         "CDS/P/DECaLS/DR5/color": "DECaLS",
         "CDS/P/DSS2/color": "DSS2",
     }
 
-    fov_deg = fov_arcsec / 3600.0
+    fov_deg = float(fov_arcsec) / 3600.0
+
+    try:
+        from PIL import Image, ImageOps  # noqa: PLC0415
+    except Exception:
+        return None, None
 
     for hips in surveys:
-        print('look for', hips)
         try:
+            params: dict[str, str | int | float] = {
+                "hips": hips,
+                "ra": ra,
+                "dec": dec,
+                "fov": fov_deg,
+                "width": size,
+                "height": size,
+                "format": "jpg",
+            }
             r = requests.get(
                 "https://alasky.cds.unistra.fr/hips-image-services/hips2fits",
-                params={
-                    "hips": hips,
-                    "ra": ra,
-                    "dec": dec,
-                    "fov": fov_deg,
-                    "width": size,
-                    "height": size,
-                    "format": "png",
-                },
+                params=params,
                 timeout=timeout,
             )
+
             if r.status_code != 200 or not r.content:
                 continue
 
-            img = Image.open(io.BytesIO(r.content)).convert("RGB")
+            img = Image.open(io.BytesIO(r.content))
+            img = ImageOps.exif_transpose(img).convert("RGB")
             arr = np.asarray(img).astype(float)
 
-            # RGB → Graustufen (optional, aber konsistent)
-            arr = (
-                0.2126 * arr[..., 0]
-                + 0.7152 * arr[..., 1]
-                + 0.0722 * arr[..., 2]
-            )
+            # RGB -> grayscale [0,1]
+            arr = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
             arr /= 255.0
 
-            return arr, LABELS.get(hips, hips)
+            return arr, labels.get(hips, hips)
 
         except Exception:
             continue
 
     return None, None
 
-# Method largely grabbed from T3 PlotLightcurves 
+
 def normalize_image_for_imshow(arr: np.ndarray) -> np.ndarray:
     """
     Convert possible image cubes into a 2D (H,W) array suitable for imshow.
@@ -152,27 +129,61 @@ def normalize_image_for_imshow(arr: np.ndarray) -> np.ndarray:
     """
     a = np.asarray(arr)
 
-    # Already 2D
     if a.ndim == 2:
         return a
 
-    # Channel-last RGB/RGBA
     if a.ndim == 3 and a.shape[2] in (3, 4):
         rgb = a[..., :3].astype(float)
         return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
 
-    # Channel-first RGB/RGBA
     if a.ndim == 3 and a.shape[0] in (3, 4):
         rgb = a[:3, ...].astype(float)
         return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
 
-    # Any other cube -> take first plane
     if a.ndim == 3:
         return a[0, ...] if a.shape[0] < a.shape[-1] else a[..., 0]
 
     raise TypeError(f"Unsupported stamp shape for imshow: {a.shape}")
 
-# Method largely grabbed from T3 PlotLightcurves 
+def add_gap_crosshair(
+    ax, *, gap_frac: float = 0.2, lw: float = 1.0, alpha: float = 0.8
+) -> None:
+    """
+    Draw a crosshair on the finder that leaves a central gap.
+    gap_frac=0.2 leaves the central 20% of the axis free in both directions.
+    """
+    if not (0.0 < gap_frac < 1.0):
+        return
+
+    g0 = 0.5 - gap_frac / 2.0
+    g1 = 0.5 + gap_frac / 2.0
+
+    # Vertical segments (x=0.5), leaving a gap [g0, g1]
+    ax.plot(
+        [0.5, 0.5], [0.0, g0], transform=ax.transAxes, lw=lw, alpha=alpha, color="white"
+    )
+    ax.plot(
+        [0.5, 0.5], [g1, 1.0], transform=ax.transAxes, lw=lw, alpha=alpha, color="white"
+    )
+
+    # Horizontal segments (y=0.5)
+    ax.plot(
+        [0.0, g0], [0.5, 0.5], transform=ax.transAxes, lw=lw, alpha=alpha, color="white"
+    )
+    ax.plot(
+        [g1, 1.0], [0.5, 0.5], transform=ax.transAxes, lw=lw, alpha=alpha, color="white"
+    )
+
+
+def clean_classprob_label(label: str) -> str:
+    """
+    Strip "P(...)" wrapper from class labels, for cleaner display.
+    """
+    if label.startswith("P(") and label.endswith(")"):
+        return label[2:-1]
+    return label
+
+ 
 def create_classprob_radar(
         classprobs: dict[str, float],
         ax: Axes,
@@ -182,8 +193,7 @@ def create_classprob_radar(
         """
         Radar chart for class probabilities.
         Shows all classes with p >= threshold.
-        Rings at 0.25, 0.5, 0.75, 1.0.
-        Gracefully handles N=1/2 via bar plot fallback.
+        Gracefully handles N<3 via normal bar plot fallback (non-polar).
         """
         # Filter + sort (descending)
         items = [(k, float(v)) for k, v in classprobs.items() if float(v) >= threshold]
@@ -191,36 +201,54 @@ def create_classprob_radar(
 
         if not items:
             ax.axis("off")
-            ax.text(0.5, 0.5, "No classes >= {:.2f}".format(threshold),
-                    ha="center", va="center", fontsize="small")
-            return ax 
+            ax.text(
+                0.5, 0.5,
+                "No classes >= {:.2f}".format(threshold),
+                ha="center", va="center", fontsize="small",
+            )
+            return ax
 
-        labels = [k for k, _ in items]
+        labels = [clean_classprob_label(k) for k, _ in items]
         vals = np.array([v for _, v in items], dtype=float)
 
-        ax.set_title(title, fontsize="small", pad=8)
-        ax.set_ylim(0.0, 1.0)
+        n = len(vals)
 
-        # Rings / radial ticks
+        # ------------------------------------------------------------
+        # Fallback: for less than 3 produce a normal bar plot
+        # ------------------------------------------------------------
+        if n < 3:
+            fig = ax.figure
+            pos = ax.get_position()
+
+            # Remove polar axis
+            ax.remove()
+
+            axb = fig.add_axes(pos)  # normal cartesian axes
+            axb.bar(range(n), vals, alpha=0.6, edgecolor="black", linewidth=0.8)
+
+            axb.set_title(title, fontsize=11, pad=6)
+            axb.set_ylim(0.0, 1.0)
+            axb.set_xticks(range(n))
+            axb.set_xticklabels(labels, fontsize=11)
+            axb.set_ylabel("p", fontsize=10)
+            axb.grid(True, axis="y", alpha=0.3)
+
+            return axb
+
+        # ------------------------------------------------------------
+        # Standard radar polygon (polar)
+        # ------------------------------------------------------------
+        ax.set_title(title, fontsize=11, pad=8)
+        ax.set_ylim(0.0, 1.08)
+        ax.spines["polar"].set_visible(False)
+        rmax = 1
+        theta_full = np.linspace(0, 2*np.pi, 361)
+        ax.plot(theta_full, np.full_like(theta_full, rmax), color="black", lw=1.0, zorder=10)
         rticks = [0.5, 1.0]
         ax.set_yticks(rticks)
-        ax.set_yticklabels([str(x) for x in rticks], fontsize=6, alpha=0.6)
-        ax.tick_params(axis="y", pad=2)
+        ax.set_yticklabels([str(x) for x in rticks], fontsize=9, alpha=0.7)
+        ax.tick_params(axis="y", pad=4)
 
-        # If too few points, a true polygon radar looks bad → fallback to bars in polar
-        n = len(vals)
-        if n < 3:
-            theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
-            width = (2 * np.pi) / max(n, 1) * 0.8
-            ax.bar(theta, vals, width=width, alpha=0.35, edgecolor="black", linewidth=0.6)
-            ax.set_xticks(theta)
-            ax.set_xticklabels(labels, fontsize=7)
-            ax.set_theta_offset(np.pi / 2.0)
-            ax.set_theta_direction(-1)
-            ax.grid(True, alpha=0.4)
-            return ax 
-
-        # Standard radar polygon
         theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
         theta_closed = np.r_[theta, theta[0]]
         vals_closed = np.r_[vals, vals[0]]
@@ -232,10 +260,22 @@ def create_classprob_radar(
         ax.fill(theta_closed, vals_closed, alpha=0.25)
 
         ax.set_xticks(theta)
-        ax.set_xticklabels(labels, fontsize=7)
+        ax.set_xticklabels(labels, fontsize=11)
         ax.grid(True, alpha=0.4)
 
-        return ax 
+        return ax
+
+def _jd_to_ymdhm(jd: float) -> str:
+    """
+    Convert Julian Date (JD) to human-readable UTC string.
+    JD -> 'YYYY-MM-DD HH:MM' (UTC)
+    """
+    try:
+        t = Time(float(jd), format="jd", scale="utc")
+        return t.iso[:16]
+    except Exception:
+        return "?"
+
 
 # Keys as provided by tabulators tied to labels and colors
 BANDINFO = {
@@ -258,11 +298,8 @@ class AmpelTransientReport():
     """
     Convenience wrapper around an `LSSTReport` for visualization and inspection.
 
-    Parameters
-    ----------
-    report : LSSTReport
-        Parsed AMPEL alert report containing object metadata, photometry,
-        classifications, and host information.
+    As a parameter, it takes an `LSSTReport` object, which is the standard format for AMPEL alert reports.
+    It contains object metadata, photometry, classifications, and host information.
     """
 
     r: LSSTReport
@@ -270,39 +307,16 @@ class AmpelTransientReport():
     catalog_thumbnail = {'stamp':None, 'label':None}
 
     def __init__(self, report: LSSTReport):
-        self.r = report
-        self.phot_table = None
-
-    def get_class_probability( self, class_name: str, mode: str='max' ) -> float:
-        """
-        Get class probability for given class name.
-        If multiple classifications exist, return max, min or average probability.
-        Args:
-            class_name: Name of class to retrieve
-            mode: 'max', 'min' or 'avg' to select how to combine multiple probabilities
-        Returns:
-            Class probability (float) or -1.0 if class not found
-
-        """
-        probs = []
-        for classification in self.r['classification']:
-            for model in classification['models']:
-                if class_name in model['probabilities']:
-                    probs.append( model['probabilities'][class_name] )
-        
-        if len(probs)==0:
-            return -1.0
-        if mode=='max':
-            return max(probs)
-        elif mode=='min':
-            return min(probs)
-        elif mode=='avg':
-            return sum(probs)/len(probs)
+        # always normalize to Pydantic model
+        if isinstance(report, LSSTReport):
+            self.r = report
         else:
-            raise ValueError('Invalid mode: {}'.format(mode))   
+            self.r = LSSTReport.model_validate(report)
+        
+        self.phot_table = None 
 
 
-    def create_table(self, backup_zp=25.0):
+    def create_table(self, backup_zp=31.4):
         """
         Convert existing list of PhotometricPoints to pandas table.
 
@@ -314,11 +328,14 @@ class AmpelTransientReport():
         - band
         """
 
-        if len(self.r['photometry'])==0:
+        if len(self.r.photometry) == 0:
             self.phot_table = None
             return
 
-        self.phot_table = pd.DataFrame.from_dict( self.r['photometry'] )
+        # pydantic objects -> list[dict] for DataFrame
+        rows = [p.model_dump() for p in self.r.photometry]
+        self.phot_table = pd.DataFrame.from_records(rows)
+
 
         # If phot points use different zeropoints, shift to backup value.
         if len(set(self.phot_table["zp"]))>1:
@@ -328,16 +345,224 @@ class AmpelTransientReport():
             self.phot_table['zp'] = backup_zp
 
     
+    def to_summary_dict(
+        self,
+        snr_limit: float = 5.0,
+        cls_threshold: float = 0.01,
+    ) -> dict[str, Any]:
+        """
+        Helper method for `inspect()`: extract a human-friendly summary dict.
+        Get key information about the object, photometry, classifications, and host.
+        """
+
+
+        r = self.r
+
+        # Object basics
+        obj = r.object
+        obj_id = obj.id
+        ext_id = obj.external_id
+        ra = obj.ra
+        dec = obj.dec
+
+
+        # Photometry summary
+        phot = r.photometry
+        phot_summary: dict[str, Any] = {
+            "n_points": 0,
+            "bands": [],
+            "time_jd_min": None,
+            "time_jd_max": None,
+            "first_utc": None,
+            "last_utc": None,
+            "n_det": 0,
+            "n_det_by_band": {},
+        }
+
+        if len(phot) > 0:
+            # build a small DF for robust stats
+            df = pd.DataFrame.from_records([p.model_dump() for p in phot]).copy()
+            for c in ("time", "flux", "fluxerr"):
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            if "band" in df.columns:
+                df["band"] = df["band"].astype(str)
+
+            df = df.dropna(subset=["time"])
+            phot_summary["n_points"] = int(len(df))
+
+            if len(df) > 0:
+                tmin = float(df["time"].min())
+                tmax = float(df["time"].max())
+                phot_summary["time_jd_min"] = tmin
+                phot_summary["time_jd_max"] = tmax
+                phot_summary["first_utc"] = _jd_to_ymdhm(tmin)
+                phot_summary["last_utc"] = _jd_to_ymdhm(tmax)
+
+                if "band" in df.columns:
+                    phot_summary["bands"] = sorted(df["band"].dropna().unique().tolist())
+
+                # detections by SNR
+                if "flux" in df.columns and "fluxerr" in df.columns:
+                    ok = np.isfinite(df["flux"]) & np.isfinite(df["fluxerr"]) & (df["fluxerr"] > 0)
+                    df2 = df.loc[ok].copy()
+                    if len(df2) > 0:
+                        snr = np.abs(df2["flux"].to_numpy(dtype=float)) / df2["fluxerr"].to_numpy(dtype=float)
+                        det = snr >= float(snr_limit)
+                        phot_summary["n_det"] = int(det.sum())
+
+                        if "band" in df2.columns:
+                            det_by_band: dict[str, int] = {}
+                            for b in sorted(df2["band"].dropna().unique()):
+                                m = (df2["band"] == b).to_numpy()
+                                det_by_band[str(b)] = int(np.sum(det[m]))
+                            phot_summary["n_det_by_band"] = det_by_band
+
+
+        # Classification summary
+        cls_threshold_f = float(cls_threshold)
+        classifications: list[dict[str, Any]] = []
+
+        for c in (r.classification or []):
+            c_entry: dict[str, Any] = {
+                "name": getattr(c, "name", None),
+                "version": getattr(c, "version", None),
+                "info": getattr(c, "info", None),
+                "models": [],
+            }
+
+            for m in (getattr(c, "models", None) or []):
+                probs = (getattr(m, "probabilities", None) or {})
+                probs_f = {str(k): float(v) for k, v in probs.items()}
+
+                items = [
+                    (clean_classprob_label(str(k)), float(v))
+                    for k, v in probs_f.items()
+                    if np.isfinite(v) and float(v) >= cls_threshold_f
+                ]
+                items.sort(key=lambda kv: kv[1], reverse=True)
+
+                c_entry["models"].append({
+                    "model": getattr(m, "model", None),
+                    "probs": probs_f,   # raw dict
+                    "top": items,       # thresholded + sorted convenience
+                })
+
+            classifications.append(c_entry)
+
+
+        # Host summary
+        host_list = r.host
+        host_summary = {"has_host": False, "redshift": None, "distance_arcsec": None, "info": None}
+
+        if len(host_list) > 0:
+            h0 = host_list[0]
+            host_summary["has_host"] = True
+            host_summary["redshift"] = float(h0.redshift) if h0.redshift is not None else None
+            host_summary["distance_arcsec"] = float(h0.distance) if h0.distance is not None else None
+            host_summary["info"] = h0.info
+
+
+        return {
+            "object": {"id": obj_id, "external_id": ext_id, "ra": ra, "dec": dec},
+            "photometry": phot_summary,
+            "classifications": classifications,
+            "host": host_summary,
+        }
+
+
+
+    def inspect(
+        self,
+        snr_limit: float = 5.0,
+        cls_threshold: float = 0.01,
+    ) -> dict[str, Any]:
+        """
+        Human-friendly one-shot overview.
+        Prints a compact summary and returns a dict with the same content.
+        """
+        r = self.r
+        out = self.to_summary_dict(
+            snr_limit=snr_limit,
+            cls_threshold=cls_threshold,
+        )
+
+        # Optional: top-level keys (quick sanity)
+        keys = sorted(list(r.model_fields.keys()))
+        print(f"Top-level keys ({len(keys)}): {', '.join(keys)}")
+
+
+        obj = out["object"]
+        print(f"Object: id={obj.get('id')}  external_id={obj.get('external_id')}")
+        if obj.get("ra") is not None and obj.get("dec") is not None:
+            print(f"  RA/Dec: {float(obj['ra']):.5f}, {float(obj['dec']):.5f} deg")
+
+        ph = out["photometry"]
+        print(f"Photometry: {ph['n_points']} pts  bands={ph['bands']}")
+        if ph["first_utc"] and ph["last_utc"]:
+            print(f"  time: {ph['first_utc']} .. {ph['last_utc']} UTC")
+        if ph["n_points"] > 0:
+            print(f"  detections (SNR≥{snr_limit:g}): {ph['n_det']}  by band: {ph['n_det_by_band']}")
+
+        cls_all = out.get("classifications", [])
+        if cls_all:
+            for i, c in enumerate(cls_all):
+                name = c.get("name", "?")
+                ver = c.get("version", "?")
+                info = c.get("info", None)
+                print(f"Classification [{i}]: {name} (v{ver})" + (f"  info={info!r}" if info else ""))
+
+                models = c.get("models", []) or []
+                if not models:
+                    print("  (no models)")
+                    continue
+
+                for j, m in enumerate(models):
+                    mname = m.get("model", "?")
+                    print(f"  Model ({j}): {mname}")
+
+                    top = m.get("top", []) or []
+                    if top:
+                        for k, v in top:
+                            print(f"    {k:12s}  p={v:.3f}")
+                    else:
+                        print(f"    (no classes ≥ {cls_threshold:g})")
+        else:
+            print("Classification: none")
+
+
+        host = out["host"]
+        if host["has_host"]:
+            z = host["redshift"]
+            d = host["distance_arcsec"]
+            print("Host:")
+            if z is not None:
+                try:
+                    print(f"  z = {float(z):.4f}")
+                except Exception:
+                    print(f"  z = {z!r}")
+            if d is not None:
+                try:
+                    print(f"  distance = {float(d):.2f} arcsec")
+                except Exception:
+                    print(f"  distance = {d!r}")
+            if host.get("info") is not None:
+                print(f"  info: {host.get('info')!r}")
+        else:
+            print("Host: none")
+
+        return out
+
+
+    
     def get_catalogimage(self, surveys: Optional[list[str]] = None):
         """
-        Load a catalog thumbnail from CDS.
+        Load a catalog thumbnail from CDS by using the helper functions.
         """
-        if surveys is None:
-            surveys = ["CDS/P/DSS2/color"]
 
         stamp, stamp_label = get_finder_stamp(
-            ra=self.r['object']['ra'], dec=self.r['object']['dec'], 
-            size=240, fov_arcsec=180.0, surveys = surveys
+            ra=self.r.object.ra, dec=self.r.object.dec, 
+            size=240, fov_arcsec=60.0, surveys = surveys
         )
         if stamp is None:
             # Set to -1 to indicate we tried but failed
@@ -348,47 +573,121 @@ class AmpelTransientReport():
                 'label':stamp_label
             }
 
+    def list_classifiers(self) -> list[dict[str, Any]]:
+        """
+        Return a notebook-friendly summary of available classifications/models.
+        """
+        out: list[dict[str, Any]] = []
+        for ci, c in enumerate(self.r.classification):
+            cinfo = {
+                "ci": ci,
+                "name": getattr(c, "name", None),
+                "version": getattr(c, "version", None),
+                "info": getattr(c, "info", None),
+                "models": [],
+            }
+            for mi, m in enumerate(getattr(c, "models", []) or []):
+                probs = getattr(m, "probabilities", {}) or {}
+                keys = sorted([clean_classprob_label(str(k)) for k in probs.keys()])
+                cinfo["models"].append({
+                    "mi": mi,
+                    "model": getattr(m, "model", None),
+                    "n_classes": len(keys),
+                    "classes": keys,
+                })
+            out.append(cinfo)
+        return out
+    
+    def print_classifiers(self, max_classes: int = 30) -> None:
+        """
+        Printer for the list of classifiers/models, with a compact summary of available classes.
+        """
+        items = self.list_classifiers()
+        print(f"n_classifications = {len(items)}")
+        for c in items:
+            print(f"\n[{c['ci']}] {c['name']}  v={c['version']}  info={c['info']!r}")
+            for m in c["models"]:
+                cls = m["classes"]
+                tail = "" if len(cls) <= max_classes else f" (+{len(cls)-max_classes} more)"
+                print(f"  ({m['mi']}) model={m['model']!r}  n_classes={m['n_classes']}")
+                print("      " + ", ".join(cls[:max_classes]) + tail)
+
+    def get_class_probabilities(
+        self,
+        classifier: int | str = 0,
+        model: int = 0,
+    ) -> dict[str, float]:
+        """
+        Select a classifier (by index or by name) and model index and return probabilities dict.
+        """
+        cls_list = self.r.classification
+
+        if isinstance(classifier, int):
+            ci = classifier
+            if ci < 0 or ci >= len(cls_list):
+                raise IndexError(f"classifier index {ci} out of range (n={len(cls_list)})")
+            c = cls_list[ci]
+        else:
+            # name lookup (first match)
+            matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
+            if not matches:
+                raise ValueError(f"No classifier with name={classifier!r}. Available: {[c.name for c in cls_list]}")
+            c = matches[0]
+
+        models = getattr(c, "models", []) or []
+        if model < 0 or model >= len(models):
+            raise IndexError(f"model index {model} out of range (n={len(models)})")
+
+        probs = getattr(models[model], "probabilities", {}) or {}
+        # normalize keys to str and values to float
+        return {str(k): float(v) for k, v in probs.items()}
+
+
     def show_classification(
-        self, 
-        ax: Optional[Axes] = None, 
-    ) -> Axes:
-        """
-        Show available classification.
-        
-        Args:
-            fig: Existing matplotlib figure (creates new if None)
-        Returns:
-            matplotlib axis object with the plot
-        """
-        if ax is None:
-            fig = plt.figure()
-            ax = fig.add_subplot(111, projection='polar')
+            self,
+            ax: Optional[Axes] = None,
+            *,
+            classifier: int | str = 0,
+            model: int = 0,
+            threshold: float = 0.01,
+        ) -> Axes:
+            """ 
+            Show a radar plot of class probabilities for a given classifier/model.
+            """
 
-        if len(self.r['classification'])==0:
-            print('No classifications available')
-            return
-        if len(self.r['classification'])>1:
-            print('Multiple classifications, currently only showing first')
+            if ax is None:
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection="polar")
 
-        return create_classprob_radar(
-            self.r['classification'][0]['models'][0]['probabilities'],
-            ax,
-            threshold = 0.01,
-            title = '{}: {}'.format(self.r['classification'][0]['name'],self.r['classification'][0]['models'][0]['model']),
-        )
+            cls_list = self.r.classification
+            if isinstance(classifier, int):
+                c = cls_list[classifier]
+            else:
+                matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
+                if not matches:
+                    raise ValueError(f"No classifier with name={classifier!r}. Available: {[c.name for c in cls_list]}")
+                c = matches[0]
+
+            m = c.models[model]
+            title = f"{c.name} (v{c.version}): {m.model}"
+
+            probs = {str(k): float(v) for k, v in (m.probabilities or {}).items()}
+            return create_classprob_radar(probs, ax, threshold=threshold, title=title)
+
+
 
     
     def show_hostinfo(
         self, 
         fig: Optional[Figure] = None, 
+        classprobs: Optional[dict[str, float]] = None,
+        cls_threshold: float = 0.01,
+        cls_max_items: int = 12,
+        classifier: int | str = 0,
+        model: int = 0
     ) -> Figure:
         """
-        Show available host / environment information.
-        
-        Args:
-            fig: Existing matplotlib figure (creates new if None)
-        Returns:
-            matplotlib figure object with the plot
+        Produce a figure showing information about class probabilities, the object and host, alongside a finder stamp if available.
         """
         
         if fig is None:
@@ -397,46 +696,122 @@ class AmpelTransientReport():
             ax_text = fig.add_subplot(gs[0])
             ax_img = fig.add_subplot(gs[1])
         else:
-            # So, this will grab the full figureß
             gs = GridSpec(1, 2, figure=fig, width_ratios=[1.2, 1])
             ax_text = fig.add_subplot(gs[0])
             ax_img = fig.add_subplot(gs[1])
 
-        # Ensure catalog thumbnail exists
         if self.catalog_thumbnail["stamp"] is None:
             self.get_catalogimage()
 
-        # ---- TEXT PANEL ----
         ax_text.axis("off")
 
-        # Collect information to print
-        lines = []
-        if len(self.r['host'])>0:
-            for key in ['redshift', 'distance', 'info']:
-                if (val:=(self.r['host'][0].get(key,None))) is not None:
-                    lines.append(f"{key}: {val}")
+        lines: list[str] = []
 
-        if len(lines)>0:
-            ax_text.text(
-                0.0,
-                1.0,
-                "\n".join(lines),
-                va="top",
-                ha="left",
-                fontsize=10,
-                family="monospace",
-                transform=ax_text.transAxes,
-            )    
-            ax_text.set_title("Host / Environment Info", fontsize=11, pad=10)
+        # ---- Class probs ----
+        if classprobs is None:
+            classprobs = self.get_class_probabilities(classifier=classifier, model=model) 
+
+        if classprobs:
+            items = [(clean_classprob_label(k), float(v)) for k, v in classprobs.items()]
+            items = [(k, v) for k, v in items if v >= cls_threshold]
+            items.sort(key=lambda kv: kv[1], reverse=True)
+
+            if items:
+                lines.append(f"Class Probabilities (p>{cls_threshold:.2f}):")
+                for k, v in items[:cls_max_items]:
+                    lines.append(f"{k}: {v:.3f}")
+                lines.append("------------------------")
+
+        # ---- Host info ----
+        host = self.r.host
+
+
+
+        if len(host) > 0:
+            lines.append("Host attributes:")
+            h0 = host[0]
+
+            z = h0.redshift
+            if z is not None:
+                lines.append(f"Redshift: {float(z):.4f}")
+
+            dist = h0.distance
+            if dist is not None:
+                lines.append(f"Host distance: {float(dist):.2f} arcsec")
+
+            info = h0.info
+            if info is not None:
+                lines.append(f"Info: {info}")
+        
+            lines.append("---------------------------")
+        
+        # ---- Object info ----
+        lines.append("Object attributes:")
+
+        phot = self.r.photometry
+        first_str, last_str = None, None
+        if isinstance(phot, list) and len(phot) > 0:
+            try:
+                times = [float(p.time) for p in phot if p.time is not None]
+                times = [float(t) for t in times]
+                if len(times) > 0:
+                    first_str = _jd_to_ymdhm(min(times))
+                    last_str  = _jd_to_ymdhm(max(times))
+            except Exception:
+                pass
+        if first_str is not None and last_str is not None:
+            lines.append(f"First phot: {first_str} UTC")
+            lines.append(f"Last phot:  {last_str} UTC")
     
-        # ---- IMAGE PANEL ----
-        if not self.catalog_thumbnail["label"] == 'fail':        
-            im = ax_img.imshow(self.catalog_thumbnail["stamp"], origin="lower", cmap="gray")
-            ax_img.set_title(self.catalog_thumbnail["label"], fontsize=11)
+        ra = self.r.object.ra
+        dec = self.r.object.dec
+        if ra is not None and dec is not None:
+            lines.append(f"RA: {float(ra):.4f} deg")
+            lines.append(f"Dec: {float(dec):.4f} deg")
+
+        if lines:
+            ax_text.text(
+                0.0, 1.0,
+                "\n".join(lines),
+                va="top", ha="left",
+                fontsize=10,
+                transform=ax_text.transAxes,
+            )
+            ax_text.set_title("Info", fontsize=11, pad=10, loc="left")
+        
+        # ---- Finder ----
+        stamp = self.catalog_thumbnail.get("stamp")
+
+        if isinstance(stamp, np.ndarray):
+            ax_img.imshow(stamp, cmap="gray")
+            add_gap_crosshair(ax_img, gap_frac=0.2, lw=1.0, alpha=0.9)
+            ax_img.set_title(self.catalog_thumbnail.get("label", "Finder"), fontsize=11)
             ax_img.set_xticks([])
             ax_img.set_yticks([])
-    
+        else:
+            ax_img.axis("off")
+            ax_img.text(0.5, 0.5, "Finder unavailable", ha="center", va="center", fontsize="small")
+
+
         return fig
+
+    
+    def _display_name(self) -> str:
+        """
+        Robust display name for plots.
+        Prefer external_id, fall back to internal object id.
+        """
+        obj = self.r.object
+        ext = obj.external_id
+        if not ext:
+            return str(obj.id)
+        ext = str(ext).strip()
+        if ext == "" or ext.lower() == "none":
+            return str(obj.id)
+        return ext
+
+
+
 
     def plot_lightcurve(
         self,
@@ -445,64 +820,235 @@ class AmpelTransientReport():
         max_tago: Optional[float] = None,
         sigma_limit: Optional[float] = None,
         ax: Optional[Axes] = None,
+        use_mag: bool = True,
         **kwargs
     ) -> Axes:
         """
         Plot photometric light curve.
-        
+
         Args:
             bands: Filter bands to plot (None for all bands)
             t_lim: Min and max JD time to plot. (None for all time)
             max_tago: Only include t_ago days past now. (None for all time)
             sigma_limit: Only plot detections above this threshold.
             ax: Existing matplotlib axes (creates new if None)
+            use_mag: Plot magnitudes instead of fluxes (AB system)
             **kwargs: Additional arguments passed to matplotlib errorbar
-            
+
         Returns:
             matplotlib axes object with the plot
         """
-        
+
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 5))
+
         if self.phot_table is None:
             self.create_table()
 
-        # Setup limits 
+        if self.phot_table is None or len(self.phot_table) == 0:
+            ax.text(0.5, 0.5, "No photometry", ha="center", va="center")
+            ax.set_axis_off()
+            return ax
+
+        df = self.phot_table
+
         if bands is None:
-            bands = set( self.phot_table["band"] )
+            bands = set(df["band"])
+
         if t_lim is None:
-            t_lim = [self.phot_table["time"].min(), self.phot_table["time"].max()]
+            t_lim = [df["time"].min(), df["time"].max()]
+
         if max_tago is not None:
-            t_lim[0] = Time.now().jd-max_tago
+            t_lim[0] = Time.now().jd - max_tago
+
         if sigma_limit is None:
-            sigma_limit = 0
-            
-        # Plot
-        for band in bands:
-            if not band in BANDINFO:
-                print('Warning: band {} not in BANDINFO, skipping'.format(band))
-                continue
-            mask = ( 
-                (self.phot_table["time"]>t_lim[0]) & 
-                (self.phot_table["time"]<t_lim[1]) & 
-                (self.phot_table["band"]==band) & 
-                (np.abs(self.phot_table["flux"]) / self.phot_table["fluxerr"]) > sigma_limit
-            )
-            ax.errorbar(
-                self.phot_table.loc[mask,"time"], 
-                self.phot_table.loc[mask,"flux"], 
-                yerr=self.phot_table.loc[mask,"fluxerr"], 
-                fmt='o', label=BANDINFO[band]['label'],
-                markersize=5, color=BANDINFO[band]['c'], **kwargs
+            sigma_limit = 0.0
+
+        if use_mag:
+            # keep only positive fluxes
+            pos = df["flux"].astype(float) > 0
+            df = df.loc[pos].copy()
+
+            if len(df) == 0:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No positive flux points",
+                    ha="center",
+                    va="center",
+                )
+                ax.set_axis_off()
+                return ax
+
+            # per-point zp preferred; fallback
+            if "zp" not in df.columns:
+                df["zp"] = 31.4
+
+            df["mag"] = -2.5 * np.log10(df["flux"].astype(float)) + df["zp"].astype(float)
+            df["magerr"] = np.abs(
+                -2.5 * df["fluxerr"].astype(float)
+                / (df["flux"].astype(float) * np.log(10))
             )
 
-        ax.legend()
-        
-        ax.set_xlabel('Time (JD)')
-        ax.set_ylabel('Flux (zp {})'.format(self.phot_table["zp"][0]))
-        ax.set_title( '{} - AMPEL {}'.format(
-            self.r['object']['external_id'], self.r['object']['id'], 
-        ) )
+        # Signal-to-noise for filtering
+        snr = np.abs(df["flux"].astype(float)) / df["fluxerr"].astype(float)
+
+        for band in bands:
+            if band not in BANDINFO:
+                print(f"Warning: band {band} not in BANDINFO, skipping")
+                continue
+
+            mask = (
+                (df["time"] > t_lim[0]) &
+                (df["time"] < t_lim[1]) &
+                (df["band"] == band) &
+                (snr > sigma_limit)
+            )
+
+            if not np.any(mask):
+                continue
+
+            if use_mag:
+                ax.errorbar(
+                    df.loc[mask, "time"],
+                    df.loc[mask, "mag"],
+                    yerr=df.loc[mask, "magerr"],
+                    fmt="o",
+                    label=BANDINFO[band]["label"],
+                    markersize=5,
+                    color=BANDINFO[band]["c"],
+                    **kwargs,
+                )
+            else:
+                ax.errorbar(
+                    df.loc[mask, "time"],
+                    df.loc[mask, "flux"],
+                    yerr=df.loc[mask, "fluxerr"],
+                    fmt="o",
+                    label=BANDINFO[band]["label"],
+                    markersize=5,
+                    color=BANDINFO[band]["c"],
+                    **kwargs,
+                )
+
+        # ----------------------------
+        # Labels & cosmetics
+        # ----------------------------
+        ax.legend(fontsize="small")
+
+        ax.set_xlabel("Time (JD)")
+
+        if use_mag:
+            ax.set_ylabel("Magnitude [AB]")
+            ax.invert_yaxis()
+        else:
+            ax.set_ylabel(f"Flux (zp {self.phot_table['zp'][0]})")
+
+        # robust title (avoid "None (id)")
+        name = self._display_name()
+        obj_id = str(self.r.object.id)
+        z = self.r.host[0].redshift if len(self.r.host) > 0 and self.r.host[0].redshift is not None else None
+        z_txt = f"{float(z):.2f}" if z is not None else "?"
+        ax.set_title(f"ID: {name} ({obj_id})  z: {z_txt}" if str(name)!=obj_id else f"ID: {name}  z: {z_txt}")
+
         ax.grid(True, alpha=0.3)
-        
+
         return ax
+
+    def draw_summary_row(
+        self,
+        subfig,
+        lc_kwargs: dict | None = None,
+        cls_threshold: float = 0.01,
+        *,
+        classifier: int | str = 0,
+        model: int = 0,
+    ) -> None:
+        """
+        Draw a summary row into an existing (sub)figure:
+        [ lightcurve | classification | host info | finder ].
+        """
+        lc_kwargs = lc_kwargs or {}
+
+        gs = GridSpec(
+            nrows=1,
+            ncols=3,
+            figure=subfig,
+            width_ratios=[2.2, 1.2, 2.0],
+            wspace=0.25,
+        )
+
+        # Lightcurve
+        ax_lc = subfig.add_subplot(gs[0, 0])
+        self.plot_lightcurve(ax=ax_lc, **lc_kwargs)
+
+        # Classification
+        ax_cls = subfig.add_subplot(gs[0, 1], projection="polar")
+
+        try:
+            cls_list = self.r.classification
+
+            if isinstance(classifier, int):
+                c = cls_list[classifier]
+            else:
+                matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
+                if not matches:
+                    raise ValueError(f"No classifier with name={classifier!r}. Available: {[c.name for c in cls_list]}")
+                c = matches[0]
+
+            m = c.models[model]
+            probs = {str(k): float(v) for k, v in (m.probabilities or {}).items()}
+            title = f"{c.name} (v{c.version}): {m.model}"
+
+            create_classprob_radar(probs, ax_cls, threshold=cls_threshold, title="Classification")
+
+            # explicit label (like before)
+            ax_cls.text(
+                0.5, -0.12,
+                title,
+                transform=ax_cls.transAxes,
+                ha="center", va="top",
+                fontsize=9, alpha=0.75,
+            )
+
+        except Exception:
+            ax_cls.axis("off")
+            ax_cls.text(
+                0.5, 0.5,
+                "No classification selected/available",
+                ha="center", va="center", fontsize="small",
+            )
+            probs = {}
+
+        host_sub = subfig.add_subfigure(gs[0, 2])
+
+        probs_for_text = probs
+
+
+        self.show_hostinfo(
+            fig=host_sub,
+            classprobs=probs_for_text,
+            cls_threshold=cls_threshold,
+            cls_max_items=12,
+            classifier=classifier,
+            model=model
+        )
+
+
+
+    def plot_summary_row(
+        self,
+        lc_kwargs: dict | None = None,
+        cls_threshold: float = 0.01,
+        classifier: int | str = 0,
+        model: int = 0,
+        figsize: tuple[float, float] = (18, 4),
+    ):
+        """
+        Wrapper for `draw_summary_row` that creates a new figure and returns it.
+        """
+        fig = plt.figure(figsize=figsize, constrained_layout=False)
+        self.draw_summary_row(fig, lc_kwargs=lc_kwargs, classifier=classifier, model=model, cls_threshold=cls_threshold)
+        return fig
+
+
