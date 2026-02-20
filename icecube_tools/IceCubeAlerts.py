@@ -4,7 +4,7 @@
 # License:             BSD-3-Clause
 # Author:              cristozilleruelo
 # Date:                11.2.2026
-# Last Modified Date:  11.2.2026
+# Last Modified Date:  19.2.2026
 # Last Modified By:    Felix Fischer
 
 """
@@ -55,10 +55,6 @@ from ligo.skymap.io.fits import read_sky_map
 import mhealpy as mhp
 
 
-# ---------------------------------------------------------------------
-# Optional default params (kept for backwards compatibility)
-# ---------------------------------------------------------------------
-
 
 _P = {
     "map_dir": "./cache_ampelaccess/IceCubeAlerts",
@@ -67,22 +63,36 @@ _P = {
     "json_alerts": "./cache_ampelaccess/IceCubeAlerts",
 }
 
+# ------------------------------------------------------------------
+# Retrieving and formating IceCube alerts
+# ------------------------------------------------------------------
 
 def _is_url(s: str) -> bool:
+    """
+    Check if a given string is a URL (starts with "http://" or "https://").
+    """
     return str(s).startswith("http://") or str(s).startswith("https://")
 
 
-def _download_to(map_url: str, map_dir: str | Path) -> str:
+def _download_to(
+    map_url: str,
+    map_dir: str | Path,
+    *,
+    timeout: float = 30.0,
+    overwrite: bool = False,
+) -> str:
     """
-    Download map_url into map_dir and return local path.
-    Overwrites existing file of same name.
+    Download a healpix map from a given URL and save it to a given directory.
     """
     file_name = map_url.split("/")[-1]
     map_dir = str(map_dir)
     os.makedirs(map_dir, exist_ok=True)
     map_path = os.path.join(map_dir, file_name)
 
-    r = requests.get(map_url, timeout=30)
+    if os.path.exists(map_path) and not overwrite:
+        return map_path
+
+    r = requests.get(map_url, timeout=timeout)
     r.raise_for_status()
 
     with open(map_path, "wb") as f:
@@ -92,6 +102,10 @@ def _download_to(map_url: str, map_dir: str | Path) -> str:
 
 
 class _HrefParser(HTMLParser):
+    """ 
+    Check for existing links in an HTML document.
+    Necessary to list all existing IceCube ROC skymaps.
+    """
     def __init__(self) -> None:
         super().__init__()
         self.hrefs: list[str] = []
@@ -110,12 +124,8 @@ def list_icecube_public_skymaps(
     timeout: float = 30.0,
 ) -> list[str]:
     """
-    List absolute URLs of public IceCube ROC skymaps in a directory listing.
-
-    Notes
-    -----
-    This returns only what is present in the given directory listing.
-    If the directory contains only 2 maps, you'll only get 2 URLs.
+    List absolute URLs of public IceCube ROC skymaps.
+    This returns only what is present in the given directory.
     """
     r = requests.get(index_url, timeout=timeout)
     r.raise_for_status()
@@ -141,19 +151,203 @@ def list_icecube_public_skymaps(
 
 def iter_icecube_public_alerts(
     index_url: str = "https://roc-2.icecube.wisc.edu/public/alerts/",
-) -> list[dict[str, str]]:
+    *,
+    download: bool = True,
+    map_dir: str | Path = _P["map_dir"],
+    timeout: float = 30.0,
+    overwrite: bool = False,
+    infer_alert_datetime: bool = False,
+) -> list[dict[str, Any]]:
     """
-    Convenience: return list of dicts compatible with your current alert schema usage:
-      {"healpix_url": "<url>"}
+    Iterate over all public IceCube ROC skymap URLs and cache if wished.
     """
-    return [{"healpix_url": u} for u in list_icecube_public_skymaps(index_url=index_url)]
+    urls = list_icecube_public_skymaps(index_url=index_url, timeout=timeout)
 
+    out: list[dict[str, Any]] = []
+    for u in urls:
+        fname = u.split("/")[-1]
+        event_name = fname.split("_")[0] if "_" in fname else fname
 
+        if download:
+            map_path = _download_to(u, map_dir, timeout=timeout, overwrite=overwrite)
+            d: dict[str, Any] = {"healpix_url": map_path, "event_name": event_name}
+
+            if infer_alert_datetime:
+                try:
+                    _hpx, header = _read_skymap_fix_coordsys(map_path, nest=True)
+                    d["alert_datetime"] = _infer_alert_datetime_from_header(header)
+                except Exception:
+                    d["alert_datetime"] = None
+
+            out.append(d)
+        else:
+            out.append({"healpix_url": u, "event_name": event_name})
+
+    return out
+def convert_txt_alerts_to_fits(
+    directory: str | Path,
+    *,
+    patterns: tuple[str, ...] = ("*.txt",),
+    timeout: float = 30.0,
+    overwrite: bool = False,
+    copy_local_files: bool = False,
+) -> dict[str, Any]:
+    """
+    Convert IceCube alert txt/json files inside `directory` into local multiorder FITS files (*.fits.gz).
+
+    The txt file can be:
+    - JSON list: [{...}, {...}]
+    - NDJSON: one JSON dict per line
+
+    Each alert dict must contain `healpix_url` (URL or local path).
+    """
+    directory = Path(directory)
+    if not directory.exists():
+        raise FileNotFoundError(str(directory))
+    if not directory.is_dir():
+        raise NotADirectoryError(str(directory))
+
+    def _parse_alert_file(p: Path) -> list[dict[str, Any]]:
+        raw = p.read_text(encoding="utf-8").strip()
+        if not raw:
+            return []
+
+        # JSON list
+        if raw.startswith("["):
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                raise ValueError(f"Expected JSON list in {p}")
+            return [x for x in data if isinstance(x, dict)]
+
+        # NDJSON
+        out: list[dict[str, Any]] = []
+        for i, line in enumerate(raw.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if not isinstance(obj, dict):
+                raise ValueError(f"Line {i} in {p} is not a JSON dict")
+            out.append(obj)
+        return out
+
+    created: list[str] = []
+    skipped_existing = 0
+    downloaded = 0
+    copied = 0
+    skipped_no_url = 0
+
+    for pat in patterns:
+        for txt_path in sorted(directory.glob(pat)):
+            alerts = _parse_alert_file(txt_path)
+
+            for a in alerts:
+                hp_url = a.get("healpix_url")
+                if not hp_url:
+                    skipped_no_url += 1
+                    continue
+
+                hp_url = str(hp_url)
+
+                # URL -> download into directory (cached)
+                if _is_url(hp_url):
+                    fname = hp_url.split("/")[-1]
+                    target = directory / fname
+
+                    if target.exists() and not overwrite:
+                        skipped_existing += 1
+                        continue
+                    local_path = _download_to(
+                        hp_url,
+                        directory,
+                        timeout=timeout,
+                        overwrite=overwrite,
+                    )
+                    created.append(local_path)
+                    downloaded += 1
+                    continue
+
+                # local path -> optional copy into directory
+                src = Path(hp_url)
+                if src.exists() and src.is_file():
+                    if copy_local_files:
+                        dst = directory / src.name
+                        if dst.exists() and not overwrite:
+                            skipped_existing += 1
+                        else:
+                            dst.write_bytes(src.read_bytes())
+                            created.append(str(dst))
+                            copied += 1
+                    continue
+
+                # if local path is invalid, treat as "no url" effectively
+                skipped_no_url += 1
+
+    return {
+        "directory": str(directory),
+        "downloaded": downloaded,
+        "copied": copied,
+        "skipped_existing": skipped_existing,
+        "skipped_no_url": skipped_no_url,
+        "created": created,
+    }
+
+def _as_value(col: Any, unit: Optional[u.Unit] = None) -> np.ndarray:
+    """
+    Convert a column (with optional unit conversion) to a numpy array.
+    Supports objects with a to_value() method, such as QTable, as well as
+    plain arrays. Important for converting .txt files to skymaps.
+    """
+    if hasattr(col, "to_value"):
+        return col.to_value(unit) if unit is not None else col.to_value()
+    return np.asarray(col)
+
+def _resolve_map_path(map_name: str, map_dir: str | Path) -> tuple[str, str]:
+    """
+    Returns (map_path, default_title)
+
+    Supports:
+    - URL -> download to map_dir
+    - existing local file path (absolute or relative) -> use directly
+    - filename relative to map_dir -> use map_dir/filename
+    """
+    if _is_url(map_name):
+        map_path = _download_to(map_name, map_dir)
+        fname = map_name.split("/")[-1]
+        default_title = fname.split("_")[0]
+        return map_path, default_title
+
+    p = Path(map_name)
+    if p.exists():
+        # user passed a direct local path
+        default_title = p.name.split("_")[0]
+        return str(p), default_title
+
+    # fallback: look in map_dir
+    map_path = str(Path(map_dir) / map_name)
+    default_title = Path(map_name).name.split("_")[0]
+    return map_path, default_title
+
+def load_icecube_skymaps(map_dir: str | Path = _P["map_dir"]) -> list[dict[str, Any]]:
+    """
+    Load local IceCube multiorder skymaps from `map_dir`.
+    """
+    p = Path(map_dir)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+
+    out: list[dict[str, Any]] = []
+    for fp in sorted(p.glob("*.fits.gz")):
+        event_name = fp.name.split("_")[0] if "_" in fp.name else fp.stem
+        out.append({"event_name": event_name, "healpix_url": str(fp)})
+
+    return out
 
 def _read_skymap_fix_coordsys(map_path: str, *, nest: bool = True) -> tuple[np.ndarray, Any]:
     """
-    Read skymap with a small robustness fix for COORDSYS='c' vs 'C'.
-    Returns (hpx, header).
+    Fix a common issue with IceCube skymaps where the FITS COORDSYS keyword is written in lowercase.
+    If the keyword is found in lowercase, it is rewritten in uppercase and the file is overwritten.
+    Then, the skymap is re-read with the corrected header.
     """
     try:
         hpx, header = read_sky_map(map_path, nest=nest)
@@ -172,17 +366,14 @@ def _infer_alert_datetime_from_header(header: Any) -> Optional[str]:
     Infer alert time from an IceCube skymap header 
     as GPS seconds in header key "gps_time" (IceCube public ROC skymaps)
 
-    Returns
-    -------
-    str | None
-        UTC timestamp as ISO string (Time(...).isot) or None if not found.
+    Returns UTC timestamp as ISO string (Time(...).isot) or None if not found.
     """
     if header is None:
         return None
 
     hdr = dict(header)
 
-    # IceCube ROC convention: gps_time (seconds since GPS epoch)
+    # Scale "gps_time" to UTC
     if "gps_time" in hdr and hdr["gps_time"] is not None:
         try:
             return Time(float(hdr["gps_time"]), format="gps", scale="utc").isot
@@ -191,7 +382,9 @@ def _infer_alert_datetime_from_header(header: Any) -> Optional[str]:
 
     return None
 
-
+# ------------------------------------------------------------------
+# Plotting the skymap
+# ------------------------------------------------------------------
 
 SOURCE_COLORS = [
     "limegreen",   
@@ -203,105 +396,63 @@ SOURCE_COLORS = [
     "deeppink",    
 ]
 
-
 def plot_IC_alert(
     map_name: str,
+    *,
     map_dir: str = _P["map_dir"],
     coord: str = "icrs",
-    nest: bool = True,
-    plot_zoom_title: bool = True,
-    use_hpx_max: bool = False,
-    save_dir: str = _P["save_dir"],
-    show_fig: bool = True,
-    hpx: Optional[np.ndarray] = None,
-    header: Optional[Any] = None,
-    use_own_hpx: bool = False,
-    normalize: bool = False,
-    title: str = "",
-    plot_source: Optional[dict[str, Any]] = None,
-    r: float = 3,
-    p_region: Optional[float] = None,
-    debug: Optional[list[dict[str, Any]]] = None,
     view: Literal["full", "zoom"] = "full",
-    alert_datetime: Optional[str] = None,
+    r: float = 3.0,
+    plot_source: Optional[dict[str, Any] | list[dict[str, Any]]] = None,
+    p_region: Optional[float] = None,
     show_alert_datetime: bool = False,
-) -> Any:
-
+    savepath: Optional[str] = None,
+    show: bool = True,
+) -> str:
+        
     """
-    Unified plotter for IceCube skymaps.
+    Plot IceCube alert probability map with optional zoom view and alert datetime.
 
-    view="full": Mollweide + zoom inset
-    view="zoom": zoom-only view
+    Parameters:
+    map_name (str): Map name or URL.
+    map_dir (str, optional): Directory for local map storage.
+    coord (str, optional): Coordinate system for plotting. 
+    view (Literal["full", "zoom"], optional): View type. 
+    r (float, optional): Zoom radius in degrees. 
+    plot_source (Optional[dict[str, Any] | list[dict[str, Any]]], optional): LSST Candidate source(s) to plot. 
+    p_region (Optional[float], optional): Cumulative probability region to highlight.
+    show_alert_datetime (bool, optional): Show alert datetime in plot title.
+    savepath (Optional[str], optional): Save plot to file.
+    show (bool, optional): Show plot.
 
-    Returns
-    -------
-    map_path : str
-      If debug is None
-    (map_path, sel_pixels_lon, sel_pixels_lat) : tuple
-      If debug is a list (quick inspection)
+    Returns:
+    str: Path to the plotted map.
+
+    Notes:
+    - Skymap header information is used to infer the alert time and center coordinates.
     """
-
+    
     ligo_coord = {"E": "geo", "icrs": "astro", "G": "galactic"}
     astropy_frame = {"icrs": "icrs", "G": "galactic"}
 
-    # --- load / read
-    if not use_own_hpx:
-        if _is_url(map_name):
-            map_path = _download_to(map_name, map_dir)
-            if not title:
-                title = map_name.split("/")[-1].split("_")[0]
-            hpx, header = _read_skymap_fix_coordsys(map_path, nest=nest)
-        else:
-            map_path = os.path.join(str(map_dir), str(map_name))
-            if not title:
-                title = str(map_name).split("_")[0]
-            hpx, header = _read_skymap_fix_coordsys(map_path, nest=nest)
-    else:
-        if hpx is None or header is None:
-            raise ValueError("use_own_hpx=True requires hpx and header to be provided.")
-        if _is_url(map_name):
-            map_path = _download_to(map_name, map_dir)
-        else:
-            map_path = os.path.join(str(map_dir), str(map_name))
-        if not title:
-            title = str(map_name).split("/")[-1].split("_")[0]
+    # --- load path + header
+    map_path, default_title = _resolve_map_path(map_name, map_dir)
+    title = default_title
 
-    if hpx is None or header is None:
-        raise RuntimeError("Internal error: hpx/header not set.")
-    
-    # --- infer alert time from header if not provided
-    if not alert_datetime:
-        alert_datetime = _infer_alert_datetime_from_header(header)
+    # read multi-order table (this is what you actually plot)
+    skymap = QTable.read(map_path)
 
-    if alert_datetime is None:
-        hdr = dict(header)
-        cand = [k for k in hdr.keys() if any(t in k.upper() for t in ("DATE", "TIME", "MJD", "JD", "UTC", "TSTART", "TSTOP", "EVENT"))]
-        print("DEBUG header time-like keys:", sorted(cand))
-        for k in sorted(cand)[:40]:
-            print(f"  {k} = {hdr.get(k)!r}")
-
-    # --- normalize
-    if normalize:
-        hpx = np.asarray(hpx, dtype=float)
-        hpx[hpx < 0] = 0.0
-        s = float(np.sum(hpx))
-        if s > 0:
-            hpx = hpx / s
-
-    # --- choose center
+    # header for center + optional time
+    # (fits header via read_sky_map is fine; we keep your COORDSYS fix)
+    _hpx, header = _read_skymap_fix_coordsys(map_path, nest=True)  # internal detail, not user-facing
     header_dict = dict(header)
-    h_ra = float(header_dict["RA"]) * u.deg
-    h_dec = float(header_dict["DEC"]) * u.deg
 
-    if use_hpx_max:
-        arg_max = int(np.argmax(hpx))
-        ra_deg, dec_deg = hp.pix2ang(int(header_dict["NSIDE"]), arg_max, lonlat=True, nest=True)
-        ra = float(ra_deg) * u.deg
-        dec = float(dec_deg) * u.deg
-    else:
-        ra = h_ra
-        dec = h_dec
+    # --- infer alert time (optional)
+    alert_datetime = _infer_alert_datetime_from_header(header)
 
+    # --- choose center from header RA/DEC (drop use_hpx_max)
+    ra = float(header_dict["RA"]) * u.deg
+    dec = float(header_dict["DEC"]) * u.deg
     center = SkyCoord(ra.to("rad"), dec.to("rad"), frame=astropy_frame.get(coord, "icrs"))
 
     # --- figure + axes layout
@@ -318,7 +469,7 @@ def plot_IC_alert(
             [1.03, 0.3, 0.42, 0.42],
             projection=f"{ligo_coord[coord]} degrees zoom",
             center=center,
-            radius=r * u.deg,
+            radius=float(r) * u.deg,
         )
 
         if coord == "icrs":
@@ -336,12 +487,17 @@ def plot_IC_alert(
         ax_inset.compass(0.9, 0.1, 0.2)
         ax_inset.grid()
 
+        ax.set_title(title)
+
+        # inset title always RA/DEC (drop plot_zoom_title toggle)
+        ax_inset.set_title(fr"RA: {ra.to_value(u.deg):.2f}$\degree$  DEC: {dec.to_value(u.deg):.2f}$\degree$")
+
     elif view == "zoom":
         ax = plt.axes(
             [0.05, 0.05, 0.8, 0.9],
             projection=f"{ligo_coord[coord]} degrees zoom",
             center=center,
-            radius=r * u.deg,
+            radius=float(r) * u.deg,
         )
         if coord == "icrs":
             for key in ["ra", "dec"]:
@@ -350,98 +506,81 @@ def plot_IC_alert(
         ax.set_xlabel("RA")
         ax.set_ylabel("DEC")
         ax.grid()
+
+        # zoom view: RA/DEC as title (fixed behavior)
+        ax.set_title(fr"RA: {ra.to_value(u.deg):.2f}$\degree$  DEC: {dec.to_value(u.deg):.2f}$\degree$")
     else:
         raise ValueError(f"Invalid view={view!r}, expected 'full' or 'zoom'.")
 
-    # Where to draw contours/sources: inset for full, main for zoom
     ax_c = ax_inset if ax_inset is not None else ax
 
-    # --- multi-order table -> prob density image
-    skymap = QTable.read(map_path)
-    prob_density = skymap["PROBDENSITY"].to_value(u.deg**-2)
+    # --- PROBDENSITY image
+    prob_density = _as_value(skymap["PROBDENSITY"], u.deg**-2)
     m = mhp.HealpixMap(data=prob_density, uniq=skymap["UNIQ"], density=True)
 
     if view == "full":
-        img_full = m.get_wcs_img(ax)
-        ax.imshow(img_full, cmap="OrRd")
-        img_inset = m.get_wcs_img(ax_c)
-        im = ax_c.imshow(img_inset, cmap="OrRd")
+        ax.imshow(m.get_wcs_img(ax), cmap="OrRd")
+        im = ax_c.imshow(m.get_wcs_img(ax_c), cmap="OrRd")
         plt.colorbar(im, label=r"Prob density [$deg^{-2}$]")
     else:
-        img = m.get_wcs_img(ax)
-        im = ax.imshow(img, cmap="OrRd")
+        im = ax.imshow(m.get_wcs_img(ax), cmap="OrRd")
         plt.colorbar(im, label=r"Prob density [$deg^{-2}$]")
 
-    # --- title
-    if view == "full":
-        ax.set_title(title)
-    else:
-        # zoom-only: keep old behavior (coord title vs map title)
-        if plot_zoom_title:
-            ax.set_title(fr"RA: {ra.to_value(u.deg):.2f}$\degree$  DEC: {dec.to_value(u.deg):.2f}$\degree$")
-        else:
-            ax.set_title(title)
-
-    # --- cumulative prob contours
+    # --- cumulative probability contours
     skymap.sort("PROBDENSITY", reverse=True)
     level, ipix = ah.uniq_to_level_ipix(skymap["UNIQ"])
     nside = ah.level_to_nside(level)
-    pixel_area = ah.nside_to_pixel_area(nside)
-    prob = pixel_area * skymap["PROBDENSITY"]
+    pixel_area_sr = ah.nside_to_pixel_area(nside).to_value(u.sr)
+    prob_density = _as_value(skymap["PROBDENSITY"])
+    prob = pixel_area_sr * prob_density
+    s = float(np.nansum(prob))
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError(f"Invalid probability normalization for map: {map_path}")
+    prob = prob / s
     cumprob = np.cumsum(prob)
-
-    i_50 = int(cumprob.searchsorted(0.5))
-    i_90 = int(cumprob.searchsorted(0.9))
 
     m_prob = mhp.HealpixMap(data=cumprob, uniq=skymap["UNIQ"], density=True)
     img_c = m_prob.get_wcs_img(ax_c)
 
-    levels_styles = [
-        (0.5, "black", "solid"),
-        (0.9, "black", "dashed"),
-    ]
+    levels_styles = [(0.5, "black", "solid"), (0.9, "black", "dashed")]
     if p_region is not None:
         p = float(p_region)
         if 0.0 < p < 1.0 and p not in (0.5, 0.9):
             levels_styles.append((p, "cyan", "solid"))
-
     levels_styles.sort(key=lambda t: t[0])
-    levels = [t[0] for t in levels_styles]
-    colors = [t[1] for t in levels_styles]
-    linestyles = [t[2] for t in levels_styles]
 
-    ax_c.contour(img_c, levels=levels, colors=colors, linestyles=linestyles)
+    ax_c.contour(
+        img_c,
+        levels=[t[0] for t in levels_styles],
+        colors=[t[1] for t in levels_styles],
+        linestyles=[t[2] for t in levels_styles],
+    )
 
-    # --- area textbox only for full view (as before)
+    # --- area textbox only in full view
     if view == "full":
-        area_50 = pixel_area[:i_50].sum().to(u.deg**2)
-        area_90 = pixel_area[:i_90].sum().to(u.deg**2)
+        i_50 = int(np.searchsorted(cumprob, 0.5))
+        i_90 = int(np.searchsorted(cumprob, 0.9))
+
+        area_50 = (pixel_area_sr[:i_50].sum() * u.sr).to(u.deg**2)
+        area_90 = (pixel_area_sr[:i_90].sum() * u.sr).to(u.deg**2)
 
         lines = []
         if alert_datetime and show_alert_datetime:
-            t = Time(alert_datetime, format="isot", scale="utc")
-            dt = t.to_value("datetime")  # python datetime (UTC)
-            date_str = dt.strftime("%Y-%m-%d")
-            time_str = dt.strftime("%H:%M")
-
-            lines.append(f"Alert UTC:\n {date_str}\n {time_str}\n\n")  # extra blank line after time
+            t = Time(alert_datetime, format="isot", scale="utc").to_value("datetime")
+            lines.append(f"Alert UTC:\n {t:%Y-%m-%d}\n {t:%H:%M}\n\n")
 
         lines.append(f"Area 50%:\n {area_50:.3f} \n\nArea 90%:\n {area_90:.3f}")
-
 
         if p_region is not None:
             p = float(p_region)
             if 0.0 < p < 1.0 and p not in (0.5, 0.9):
-                i_p = int(cumprob.searchsorted(p))
-                area_p = pixel_area[:i_p].sum().to(u.deg**2)
+                i_p = int(np.searchsorted(cumprob, p))
+                area_p = (pixel_area_sr[:i_p].sum() * u.sr).to(u.deg**2)
                 lines.append(f"\n\nArea {p*100:.0f}%:\n {area_p:.3f}")
 
-        text_str = "".join(lines)
-
         props = dict(boxstyle="round", facecolor="wheat", alpha=0.5)
-        ax.text(1.9, 0.5, text_str, fontsize=14, bbox=props, transform=ax.transAxes,va="center")
-
-
+        ax.text(1.9, 0.5, "".join(lines), fontsize=14, bbox=props, transform=ax.transAxes, va="center")
+        
     # --- plot candidate source(s)
     if plot_source:
         sources = plot_source if isinstance(plot_source, list) else [plot_source]
@@ -450,156 +589,34 @@ def plot_IC_alert(
         for s in sources:
             color = next(color_cycle)
             name = str(s.get("name", s.get("id", "source")))
-            ax_c.plot(
-                float(s["ra"]),
-                float(s["dec"]),
-                "o",
-                c=color,
-                transform=ax_c.get_transform("world"),
-            )
+            ax_c.plot(float(s["ra"]), float(s["dec"]), "o", c=color, transform=ax_c.get_transform("world"))
             handles.append(Line2D([0], [0], marker="o", linestyle="None", label=name, color=color))
-
         if handles:
             ax_c.legend(handles=handles, framealpha=1, fontsize=8, loc="upper right")
 
-    # --- zoom title on full inset (old behavior)
-    if view == "full" and plot_zoom_title and ax_inset is not None:
-        ax_inset.set_title(fr"RA: {ra.to_value(u.deg):.2f}$\degree$  DEC: {dec.to_value(u.deg):.2f}$\degree$")
+    # --- save/show
+    if savepath:
+        Path(savepath).parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(savepath, bbox_inches="tight")
 
-    # --- debug pixels (only meaningful in zoom view; kept for convenience)
-    sel_pixels_lat: list[float] = []
-    sel_pixels_lon: list[float] = []
-    if isinstance(debug, list):
-        for dict_nside in debug:
-            ns = int(dict_nside["nside"])
-            pixels = dict_nside["pixels"]
-            lon, lat = ah.healpix_to_lonlat(pixels, nside=ns, order="nested")
-            sel_pixels_lat.extend(list(lat.to_value(u.deg)))
-            sel_pixels_lon.extend(list(lon.to_value(u.deg)))
-
-        ax_c.scatter(
-            sel_pixels_lon,
-            sel_pixels_lat,
-            c="green",
-            marker=".",
-            s=3,
-            transform=ax_c.get_transform("world"),
-            alpha=0.5,
-            label="Queried pixels",
-        )
-        ax_c.legend(fontsize=14)
-        ax_c.set_title("Debug: Accepted pixels", fontsize=14)
-
-    # --- saving
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        suffix = "_mw_zoom.png" if view == "zoom" else "_mw.png"
-        plt.savefig(os.path.join(save_dir, f"{title}{suffix}"), bbox_inches="tight")
-
-    if show_fig:
+    if show:
         plt.show()
+    else:
+        plt.close(fig)
 
-    if isinstance(debug, list):
-        return map_path, sel_pixels_lon, sel_pixels_lat
     return map_path
 
 
-def set_new_alert(ic_alert: dict[str, Any], yaml_dict: dict[str, Any]) -> dict[str, Any]:
-    """
-    Rewrite an Ampel job yaml template dict for a new IC alert.
-
-    Parameters
-    ----------
-    ic_alert : dict
-        JSON schema object from the GCN Kafka stream.
-    yaml_dict : dict
-        Parsed YAML template.
-
-    Returns
-    -------
-    yaml_dict : dict
-        Updated YAML dict.
-    """
-    map_name = ic_alert["healpix_url"].split("/")[-1]
-    date_str = ic_alert["alert_datetime"].split("T")[0]
-
-    params = yaml_dict["task"][0]["config"]["execute"][0]["config"]["execute"][0]["config"]
-
-    params["map_name"] = map_name
-    params["map_url"] = ic_alert["healpix_url"]
-    params["date_str"] = date_str
-    params["map_dir"] = "/Users/cristozilleruelo/Ampel-HU-astro/RubiCube/ic_alerts_temp"
-
-    yaml_dict["task"][0]["config"]["execute"][0]["config"]["execute"][0]["config"] = params
-
-    stream_list = yaml_dict["task"][1]["config"]["supplier"]["config"]["loader"]["config"]["stream"].split("_")
-    stream_list.pop(0)
-    new_name = "%%" + map_name.split("_")[0]
-    stream_list.insert(0, new_name)
-    yaml_dict["task"][1]["config"]["supplier"]["config"]["loader"]["config"]["stream"] = "_".join(stream_list)
-
-    if isinstance(ic_alert.get("event_name"), list):
-        ic_alert["event_name"] = ic_alert["event_name"][0]
-
-    file_name = str(ic_alert["event_name"]) + ".pdf"
-    pdf_path = yaml_dict["task"][3]["config"]["stage"]["config"]["execute"][0]["config"]["pdf_path"]
-    directory = os.path.join(*pdf_path.split("/")[:-1])
-    yaml_dict["task"][3]["config"]["stage"]["config"]["execute"][0]["config"]["pdf_path"] = os.path.join(os.sep, directory, file_name)
-
-    return yaml_dict
-
-
-def write_new_yaml(
-    ic_alert: dict[str, Any] | str,
-    yaml_name: str,
-    save_name: str = "",
-    save_dir: str = _P["file_dir"],
-) -> str:
-    """
-    Write an updated Ampel job YAML for a new IC alert.
-
-    Parameters
-    ----------
-    ic_alert : dict | str
-        IC alert schema dict or JSON string.
-    yaml_name : str
-        Template YAML filename in save_dir.
-    save_name : str
-        Output filename; if empty, overwrites yaml_name.
-    save_dir : str
-        Directory containing templates / where output is written.
-
-    Returns
-    -------
-    path : str
-        Path to written YAML file.
-    """
-    import yaml  # local import to keep module import light
-
-    with open(os.path.join(save_dir, yaml_name), "r") as f:
-        yaml_dict = yaml.safe_load(f)
-
-    if isinstance(ic_alert, str):
-        ic_alert = json.loads(ic_alert)
-
-    new_yaml = set_new_alert(ic_alert, yaml_dict)
-
-    if save_name == "":
-        save_name = yaml_name
-
-    out_path = os.path.join(save_dir, save_name)
-    with open(out_path, "w") as f:
-        yaml.dump(new_yaml, f, sort_keys=False)
-
-    return out_path
+# ------------------------------------------------------------------
+# Filters
+# ------------------------------------------------------------------
 
 def _extract_sources(sources: Any) -> list[dict[str, Any]]:
     """
     Normalize input to list of dicts:
       {"id": str, "ra": float, "dec": float, "name": str}
 
-    Supported inputs
-    ----------------
+    Supported inputs:
     - (ra, dec) tuple/list
     - iterable of (ra, dec) tuples/lists
     - LSSTReport (pydantic) or dict-like with ["object"]["ra","dec","id"]
@@ -676,28 +693,27 @@ def select_pixels_sets(
     map_url: str,
     p_region: float = 0.9,
     map_dir: str = _P["map_dir"],
-    nest: bool = True,
 ) -> dict[int, set[int]]:
     """
     Select HEALPix pixels covering top p_region probability mass.
-
-    Returns
-    -------
-    dict: nside -> set(pixel_index)
     """
     map_path = _download_to(map_url, map_dir)
-    _hpx, _header = _read_skymap_fix_coordsys(map_path, nest=nest)
 
     skymap = QTable.read(map_path)
     skymap.sort("PROBDENSITY", reverse=True)
 
     level, ipix = ah.uniq_to_level_ipix(skymap["UNIQ"])
     nside = ah.level_to_nside(level)
-    pixel_area = ah.nside_to_pixel_area(nside)
-    prob = pixel_area * skymap["PROBDENSITY"]
-    cumprob = np.cumsum(prob)
+    pixel_area_sr = ah.nside_to_pixel_area(nside).to_value(u.sr)
+    prob_density = _as_value(skymap["PROBDENSITY"])
+    prob = pixel_area_sr * prob_density
+    s = float(np.nansum(prob))
+    if not np.isfinite(s) or s <= 0:
+        raise ValueError(f"Invalid probability normalization for map: {map_path}")
+    prob = prob / s
+    probsum = np.cumsum(prob)
 
-    region_index = int(cumprob.searchsorted(float(p_region)))
+    region_index = int(probsum.searchsorted(float(p_region)))
 
     out: dict[int, set[int]] = {}
     for ns_i, ip_i in zip(nside[:region_index], ipix[:region_index]):
@@ -712,27 +728,26 @@ def check_sources_in_map(
     map_url: str,
     p_region: float = 0.9,
     map_dir: str = _P["map_dir"],
-    nest: bool = True,
     *,
     plot: bool = True,
     plot_kwargs: Optional[dict[str, Any]] = None,
 ) -> dict[str, bool]:
     """
-    Check multiple sources against the p_region containment region.
+    Check if a set of sources are inside a given probability region of a healpix map.
 
-    Parameters
-    ----------
-    sources:
-      see _extract_sources()
-    plot:
-      If True, plot once and mark all sources.
+    Parameters:
+    sources : List of sources to check, or a single source as dict.
+    map_url : URL of the healpix map.
+    p_region : Cumulative probability region to consider.
+    map_dir : Directory for local map storage.
+    plot : Plot the sources on the map.
+    plot_kwargs : Keyword arguments for plot_IC_alert.
 
-    Returns
-    -------
-    dict: object_id (string) -> in_region (bool)
+    Returns: Dictionary with source IDs as keys 
+    and a boolean indicating if the source is inside the region as values.
     """
     src_list = _extract_sources(sources)
-    pix_sets = select_pixels_sets(map_url, p_region=p_region, map_dir=map_dir, nest=nest)
+    pix_sets = select_pixels_sets(map_url, p_region=p_region, map_dir=map_dir)
 
     results: dict[str, bool] = {}
     for s in src_list:
@@ -753,14 +768,13 @@ def check_sources_in_map(
         results[str(s["id"])] = inside
 
     if plot:
-        # mark all sources in ONE plot
-        plot_kwargs = plot_kwargs or {}
         plot_IC_alert(
             map_url,
             map_dir=map_dir,
-            save_dir=str(Path(map_dir) / "SourceChecks"),
+            view="full",
             p_region=p_region,
-            plot_source=src_list,   # see next section (plot_IC_alert patch)
+            plot_source=src_list,
+            savepath=str(Path(map_dir) / "SourceChecks"),
             **plot_kwargs,
         )
 
@@ -780,7 +794,7 @@ if __name__ == "__main__":
 
         for alert in IC_alerts:
             try:
-                plot_IC_alert(alert["healpix_url"], show_fig=False, print_radec_diff=True)
+                plot_IC_alert(alert["healpix_url"], show=False)
                 plt.close()
             except IndexError as e:
                 name = str(alert.get("event_name", "UNKNOWN"))
@@ -794,16 +808,12 @@ if __name__ == "__main__":
 class IceCubeAlert:
     """
     Convenience wrapper for a single IceCube alert.
-
-    Encapsulates:
-    - JSON parsing (from Kafka string or dict)
-    - healpix_url handling
-    - basic plotting helpers
-
-    Designed for minimal notebook usage.
+    Encapsulates JSON parsing, healpix_url handling and basic plotting helpers.
     """
-
     def __init__(self, alert_dict: dict[str, Any]):
+        """
+        Initialize IceCubeAlert object.
+        """
         self.raw = alert_dict
 
         self.healpix_url: str = str(alert_dict.get("healpix_url", ""))
@@ -837,7 +847,7 @@ class IceCubeAlert:
         return cls(alert_dict)
 
     # ------------------------------------------------------------------
-    # Core functionality
+    # Plotting and Checking
     # ------------------------------------------------------------------
 
     def plot(
@@ -846,22 +856,21 @@ class IceCubeAlert:
         zoom: bool = False,
         show: bool = True,
         show_alert_datetime: bool = False,
+        savepath: Optional[str] = None,
         **kwargs,
     ) -> str:
         """
         Plot this alert's HEALPix skymap.
-
-        zoom=False -> full (mollweide + inset)
-        zoom=True  -> zoom-only
         """
         return plot_IC_alert(
             self.healpix_url,
             view="zoom" if zoom else "full",
-            show_fig=show,
-            alert_datetime=self.alert_datetime,
+            show=show,
             show_alert_datetime=show_alert_datetime,
+            savepath=savepath,
             **kwargs,
         )
+
 
     def contains_source(
         self,
@@ -874,6 +883,9 @@ class IceCubeAlert:
         **kwargs,
     ) -> bool | dict[str, bool]:
 
+        """
+        Check if a set of sources are inside a given probability region of this alert's HEALPix skymap.
+        """
         if sources is None:
             if ra is None or dec is None:
                 raise ValueError("Provide either sources=... or ra/dec")
@@ -887,11 +899,6 @@ class IceCubeAlert:
             plot_kwargs=kwargs,
         )
 
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
-
     def summary(self) -> dict[str, Any]:
         """
         Return minimal summary dict.
@@ -902,9 +909,4 @@ class IceCubeAlert:
             "alert_datetime": self.alert_datetime,
         }
 
-    def __repr__(self) -> str:
-        return (
-            f"IceCubeAlert(event_name={self.event_name!r}, "
-            f"datetime={self.alert_datetime!r})"
-        )
 
