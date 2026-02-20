@@ -4,7 +4,7 @@
 # License:             BSD-3-Clause
 # Author:              jno
 # Date:                19.1.2026
-# Last Modified Date:  10.2.2026
+# Last Modified Date:  19.2.2026
 # Last Modified By:    Felix Fischer
 
 """
@@ -42,7 +42,9 @@ from matplotlib.gridspec import GridSpec
 
 from .LSSTReportModel import LSSTReport
 
-
+# ------------------------------------------------------------
+# Finder stamp (Thumbnails)
+# ------------------------------------------------------------
 
 def get_finder_stamp(
     ra: float,
@@ -53,7 +55,7 @@ def get_finder_stamp(
     fov_arcsec: float = 45.0,
 ) -> tuple[np.ndarray | None, str | None]:
     """
-    Best-effort finder stamp: CDS hips2fits JPEG fallback
+    Best-effort finder stamp: CDS hips2fits JPEG
 
     Returns (image_array, label). image_array is 2D float array or None.
     """
@@ -75,6 +77,11 @@ def get_finder_stamp(
         "CDS/P/DSS2/color": "DSS2",
     }
 
+    BASE_URLS = [
+    "https://alasky.cds.unistra.fr/hips-image-services/hips2fits",
+    "https://alaskybis.cds.unistra.fr/hips-image-services/hips2fits",
+    ]
+
     fov_deg = float(fov_arcsec) / 3600.0
 
     try:
@@ -92,12 +99,10 @@ def get_finder_stamp(
                 "width": size,
                 "height": size,
                 "format": "jpg",
+                "projection": "TAN",
             }
-            r = requests.get(
-                "https://alasky.cds.unistra.fr/hips-image-services/hips2fits",
-                params=params,
-                timeout=timeout,
-            )
+            for base_url in BASE_URLS:
+                r = requests.get(base_url, params=params, timeout=timeout)
 
             if r.status_code != 200 or not r.content:
                 continue
@@ -112,7 +117,8 @@ def get_finder_stamp(
 
             return arr, labels.get(hips, hips)
 
-        except Exception:
+        except Exception as e:
+            print(f"[finder] hips={hips} failed: {type(e).__name__}: {e}")
             continue
 
     return None, None
@@ -120,12 +126,14 @@ def get_finder_stamp(
 
 def normalize_image_for_imshow(arr: np.ndarray) -> np.ndarray:
     """
-    Convert possible image cubes into a 2D (H,W) array suitable for imshow.
-    Handles shapes:
-      (H,W) -> unchanged
-      (H,W,3/4) -> luminance
-      (3/4,H,W) -> luminance
-      (N,H,W) with N!=3/4 -> take first plane
+    Normalize an image array to the range [0,1] for display with imshow.
+
+    The image array is assumed to be in one of the following formats:
+    - 2D grayscale image
+    - 3D RGB image, either as (height, width, 3) or (3, height, width)
+    - 3D RGBA image, either as (height, width, 4) or (4, height, width)
+
+    If the image array has an unsupported shape, a TypeError is raised.
     """
     a = np.asarray(arr)
 
@@ -174,6 +182,9 @@ def add_gap_crosshair(
         [g1, 1.0], [0.5, 0.5], transform=ax.transAxes, lw=lw, alpha=alpha, color="white"
     )
 
+# ------------------------------------------------------------
+# Spider diagram for classification
+# ------------------------------------------------------------
 
 def clean_classprob_label(label: str) -> str:
     """
@@ -213,9 +224,7 @@ def create_classprob_radar(
 
         n = len(vals)
 
-        # ------------------------------------------------------------
         # Fallback: for less than 3 produce a normal bar plot
-        # ------------------------------------------------------------
         if n < 3:
             fig = ax.figure
             pos = ax.get_position()
@@ -235,9 +244,7 @@ def create_classprob_radar(
 
             return axb
 
-        # ------------------------------------------------------------
         # Standard radar polygon (polar)
-        # ------------------------------------------------------------
         ax.set_title(title, fontsize=11, pad=8)
         ax.set_ylim(0.0, 1.08)
         ax.spines["polar"].set_visible(False)
@@ -264,6 +271,10 @@ def create_classprob_radar(
         ax.grid(True, alpha=0.4)
 
         return ax
+
+# ------------------------------------------------------------
+# Small Helper
+# ------------------------------------------------------------
 
 def _jd_to_ymdhm(jd: float) -> str:
     """
@@ -307,18 +318,24 @@ class AmpelTransientReport():
     catalog_thumbnail = {'stamp':None, 'label':None}
 
     def __init__(self, report: LSSTReport):
-        # always normalize to Pydantic model
+        """
+        Initialize an AmpelTransientReport from an LSSTReport.
+        If the input is a dictionary, it is validated against the LSSTReport model.
+        """
         if isinstance(report, LSSTReport):
             self.r = report
         else:
             self.r = LSSTReport.model_validate(report)
         
         self.phot_table = None 
-
+        
+    # ------------------------------------------------------------
+    # Inspect the Report
+    # ------------------------------------------------------------
 
     def create_table(self, backup_zp=31.4):
         """
-        Convert existing list of PhotometricPoints to pandas table.
+        Convert existing list of Photometric Points to pandas table.
 
         Assumes photometry datapoints contain:
         - time (JD)
@@ -553,7 +570,9 @@ class AmpelTransientReport():
 
         return out
 
-
+    # ------------------------------------------------------------
+    # Finder stamp (Thumbnails)
+    # ------------------------------------------------------------
     
     def get_catalogimage(self, surveys: Optional[list[str]] = None):
         """
@@ -572,6 +591,10 @@ class AmpelTransientReport():
                 'stamp':normalize_image_for_imshow(stamp), 
                 'label':stamp_label
             }
+
+    # ------------------------------------------------------------
+    # Classification and Classifier
+    # ------------------------------------------------------------
 
     def list_classifiers(self) -> list[dict[str, Any]]:
         """
@@ -612,70 +635,108 @@ class AmpelTransientReport():
                 print(f"  ({m['mi']}) model={m['model']!r}  n_classes={m['n_classes']}")
                 print("      " + ", ".join(cls[:max_classes]) + tail)
 
-    def get_class_probabilities(
-        self,
-        classifier: int | str = 0,
-        model: int = 0,
-    ) -> dict[str, float]:
+    def get_class_probabilities(self, classifier=0, model=0):
         """
         Select a classifier (by index or by name) and model index and return probabilities dict.
+        If there are no probabilities, return an empty dict.
         """
-        cls_list = self.r.classification
+        cls_list = getattr(self.r, "classification", None)
+
+        # Robust fallback
+        if not cls_list:
+            return {}
 
         if isinstance(classifier, int):
             ci = classifier
             if ci < 0 or ci >= len(cls_list):
-                raise IndexError(f"classifier index {ci} out of range (n={len(cls_list)})")
+                return {}
             c = cls_list[ci]
         else:
-            # name lookup (first match)
             matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
             if not matches:
-                raise ValueError(f"No classifier with name={classifier!r}. Available: {[c.name for c in cls_list]}")
+                return {}
             c = matches[0]
 
-        models = getattr(c, "models", []) or []
+        models = getattr(c, "models", None) or []
         if model < 0 or model >= len(models):
-            raise IndexError(f"model index {model} out of range (n={len(models)})")
+            return {}
 
-        probs = getattr(models[model], "probabilities", {}) or {}
-        # normalize keys to str and values to float
-        return {str(k): float(v) for k, v in probs.items()}
-
-
-    def show_classification(
-            self,
-            ax: Optional[Axes] = None,
-            *,
-            classifier: int | str = 0,
-            model: int = 0,
-            threshold: float = 0.01,
-        ) -> Axes:
-            """ 
-            Show a radar plot of class probabilities for a given classifier/model.
-            """
-
-            if ax is None:
-                fig = plt.figure()
-                ax = fig.add_subplot(111, projection="polar")
-
-            cls_list = self.r.classification
-            if isinstance(classifier, int):
-                c = cls_list[classifier]
-            else:
-                matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
-                if not matches:
-                    raise ValueError(f"No classifier with name={classifier!r}. Available: {[c.name for c in cls_list]}")
-                c = matches[0]
-
-            m = c.models[model]
-            title = f"{c.name} (v{c.version}): {m.model}"
-
-            probs = {str(k): float(v) for k, v in (m.probabilities or {}).items()}
-            return create_classprob_radar(probs, ax, threshold=threshold, title=title)
+        m = models[model]
+        probs = getattr(m, "probabilities", None) or {}
+        # ensure plain dict[str,float]-ish
+        out = {}
+        for k, v in probs.items():
+            try:
+                out[str(k)] = float(v)
+            except Exception:
+                continue
+        return out
 
 
+    def show_classification(self, ax=None, classifier=0, model=0, threshold=0.0, **kwargs):
+        """
+        Show a radar plot of class probabilities for a given classifier/model.
+        If there is no classification at all, show a placeholder.
+        """
+        cls_list = getattr(self.r, "classification", None)
 
+        # create ax if needed (polar)
+        if ax is None:
+            fig = plt.figure(figsize=(4, 4), dpi=100)
+            ax = fig.add_subplot(111, projection="polar")
+
+        # helper: show placeholder
+        def _placeholder(msg: str) -> Any:
+            ax.set_axis_off()
+            ax.text(
+                0.5, 0.5, msg,
+                transform=ax.transAxes,
+                ha="center", va="center",
+                fontsize=10,
+            )
+            return ax
+
+        # robust fallback: no classification at all
+        if not cls_list:
+            return _placeholder("No classification")
+
+        # pick classifier
+        if isinstance(classifier, int):
+            ci = classifier
+            if ci < 0 or ci >= len(cls_list):
+                return _placeholder(f"No classifier idx {ci}")
+            c = cls_list[ci]
+        else:
+            matches = [c for c in cls_list if getattr(c, "name", None) == classifier]
+            if not matches:
+                return _placeholder(f"No classifier '{classifier}'")
+            c = matches[0]
+
+        models = getattr(c, "models", None) or []
+        if model < 0 or model >= len(models):
+            return _placeholder(f"No model idx {model}")
+
+        m = models[model]
+        title = f"{getattr(c,'name','')} (v{getattr(c,'version','')}): {getattr(m,'model','')}"
+
+        probs_raw = getattr(m, "probabilities", None) or {}
+        probs = {}
+        for k, v in probs_raw.items():
+            try:
+                probs[str(k)] = float(v)
+            except Exception:
+                continue
+
+        # optional: if probs empty, also placeholder (depends on your taste)
+        if not probs:
+            return _placeholder("No probabilities")
+
+        return create_classprob_radar(probs, ax, threshold=threshold, title=title)
+
+
+    # ------------------------------------------------------------
+    # Info Block
+    # ------------------------------------------------------------
     
     def show_hostinfo(
         self, 
@@ -811,7 +872,9 @@ class AmpelTransientReport():
         return ext
 
 
-
+    # ------------------------------------------------------------
+    # Plot the Lightcurve
+    # ------------------------------------------------------------
 
     def plot_lightcurve(
         self,
@@ -826,17 +889,13 @@ class AmpelTransientReport():
         """
         Plot photometric light curve.
 
-        Args:
-            bands: Filter bands to plot (None for all bands)
-            t_lim: Min and max JD time to plot. (None for all time)
-            max_tago: Only include t_ago days past now. (None for all time)
-            sigma_limit: Only plot detections above this threshold.
-            ax: Existing matplotlib axes (creates new if None)
-            use_mag: Plot magnitudes instead of fluxes (AB system)
-            **kwargs: Additional arguments passed to matplotlib errorbar
-
-        Returns:
-            matplotlib axes object with the plot
+        bands: Filter bands to plot
+        t_lim: Min and max JD time to plot.
+        max_tago: Only include t_ago days past now.
+        sigma_limit: Only plot detections above this threshold.
+        ax: Existing matplotlib axes
+        use_mag: Plot magnitudes instead of fluxes
+        **kwargs: Additional arguments passed to matplotlib errorbar
         """
 
         if ax is None:
@@ -931,9 +990,7 @@ class AmpelTransientReport():
                     **kwargs,
                 )
 
-        # ----------------------------
         # Labels & cosmetics
-        # ----------------------------
         ax.legend(fontsize="small")
 
         ax.set_xlabel("Time (JD)")
@@ -954,7 +1011,11 @@ class AmpelTransientReport():
         ax.grid(True, alpha=0.3)
 
         return ax
-
+    
+    # ------------------------------------------------------------
+    # Display the report (using methods above)
+    # ------------------------------------------------------------
+    
     def draw_summary_row(
         self,
         subfig,

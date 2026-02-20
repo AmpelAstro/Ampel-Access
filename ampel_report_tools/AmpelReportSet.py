@@ -4,7 +4,7 @@
 # License:             BSD-3-Clause
 # Author:              jno
 # Date:                19.1.2026
-# Last Modified Date:  10.2.2026
+# Last Modified Date:  19.2.2026
 # Last Modified By:    Felix Fischer
 
 """ 
@@ -18,6 +18,7 @@ This module defines the `AmpelReportSet` class. It provides functionality for:
 - Merging new reports with existing ones based on object ID and photometry time into a cache of per-object pickles.
 - Summarizing classifier/model availability across the set of reports.
 - Dynamic filtering of the active report subset based on user-defined criteria (e.g. class probabilities, redshift, detection count).
+- Checking for potential LSST sources in IceCube's HEALPix skymap.
 - Producing summary figures showing light curves, classifications, host info, and finder stamps of each active report.
 
 """
@@ -446,21 +447,12 @@ class AmpelReportSet:
         cls_threshold: float | None = None,
     ) -> dict[str, Any]:
         """
-        Aggregate classification availability across reports.
+        Aggregate classification information across reports.
 
-        Parameters
-        ----------
-        active_only : bool
-            If True, use self.active_reports, else self.reports (all).
-        model_index : int
-            Which model index to inspect within each classifier entry (default: 0).
+        active_only : If True, only active reports, else all reports.
+        model_index : Which model index to inspect within each classifier entry.
             If out of range for a report, that report counts as "no model".
-        cls_threshold : float | None
-            If set, only count class labels with p >= threshold when collecting keys.
-
-        Returns
-        -------
-        dict with counts and per-(name, version, model) stats.
+        cls_threshold : If set, only count class labels with p >= threshold when collecting keys.
         """
         reports = self.active_reports if active_only else list(self.reports.values())
 
@@ -517,8 +509,6 @@ class AmpelReportSet:
                             continue
                         classkey_union[key].add(str(k))
 
-            # fix "has any model": check per-report
-            # (do this after iterating classifiers)
             if any((getattr(c, "models", None) or []) for c in cls_list):
                 n_has_any_model += 1
 
@@ -706,6 +696,9 @@ class AmpelReportSet:
         )
 
     def filter_sky_region(self, ra_range: tuple[float, float], dec_range: tuple[float, float]) -> None:
+        """
+        Filter reports based on sky region (RA, DEC).
+        """
         def _f(r: AmpelTransientReport) -> bool:
             ra = float(r.r.object.ra)
             dec = float(r.r.object.dec)
@@ -899,12 +892,14 @@ class AmpelReportSet:
         *,
         p_region: float = 0.9,
         map_dir: str = "./cache_ampelaccess/IceCubeAlerts",
-        nest: bool = True,
         label: str | None = None,
         max_days_before: float | None = None,
         max_days_after: float | None = None,
-    ) -> None:
-
+    ) -> None: 
+        """
+        Filter on whether a transient is inside a given probability region of an IceCube alert's HEALPix skymap.
+        Optionally, also filter on a time window around the alert's time, referred to first LSST alert of the transient. 
+        """
         # resolve URL
         if hasattr(icecube_alert, "healpix_url"):
             map_url = str(getattr(icecube_alert, "healpix_url"))
@@ -913,7 +908,7 @@ class AmpelReportSet:
 
         # compute region pixels ONCE
         pix_sets = select_pixels_sets(
-            map_url, p_region=p_region, map_dir=map_dir, nest=nest
+            map_url, p_region=p_region, map_dir=map_dir
         )
 
         # --- optional IC time ---
@@ -935,10 +930,6 @@ class AmpelReportSet:
                     )
             except Exception:
                 ic_jd = None
-
-        # --------------------------
-        # actual filter function
-        # --------------------------
 
         def _f(r: "AmpelTransientReport") -> bool:
 
@@ -1023,7 +1014,7 @@ class AmpelReportSet:
         """
         Return dict mapping preset_name -> function(ars, **overrides) that calls existing filters.
         
-        FIX NEEDED: The presets are preliminary!
+        Note: The presets are preliminary!
         """
         def recent_young_highz_snia(
             ars: "AmpelReportSet",
@@ -1069,7 +1060,6 @@ class AmpelReportSet:
         *,
         p_region: float = 0.9,
         map_dir: str = "./cache_ampelaccess/IceCubeAlerts",
-        nest: bool = True,
         use_all_reports: bool = False,
         return_obj_to_ics: bool = True,
         drop_empty: bool = True,
@@ -1078,16 +1068,14 @@ class AmpelReportSet:
         max_days_before: float | None = None,
         max_days_after: float | None = None,
     ) -> tuple[dict[str, list[str]], dict[str, list[str]] | None]:
-
         """
-        Match LSST reports to one or multiple IceCube alerts (OR semantics per alert).
-
-        Returns
-        -------
-        ic_to_objs : dict
-            ic_id -> [object_id, ...]
-        obj_to_ics : dict | None
-            object_id -> [ic_id, ...]  (optional)
+        Match LSST reports to IceCube alerts given a probability region (p) of the HEALPix skymap.
+        Optionally, also filter on a time window around the alert's time, referred to first LSST alert of the transient.
+        Use all reports if use_all_reports=True, else only active ones.
+        Return a dictionary mapping IC alert ID to a list of LSST object IDs.
+        If return_obj_to_ics=True, return a second dictionary mapping LSST object ID to a list of IC alert IDs.
+        Drop empty matches if drop_empty=True.
+        Print some statistics if verbose=True.
         """
         # normalize alerts to list
         if not isinstance(icecube_alerts, (list, tuple)):
@@ -1095,7 +1083,6 @@ class AmpelReportSet:
 
         reports = self.reports if use_all_reports else self.active_reports
 
-        # Precompute pixel sets per IC alert (IC few => OK)
         use_time = (max_days_before is not None) or (max_days_after is not None)
         if use_time:
             if max_days_before is None:
@@ -1104,17 +1091,40 @@ class AmpelReportSet:
                 max_days_after = 0.0
 
         ic_maps: list[tuple[str, dict[int, set[int]], float | None]] = []
+
+        def _normalize_ic_id(x: Any, fallback: str) -> str:
+            """
+            Return a stable, hashable IceCube alert id.
+            """
+            if x is None:
+                return str(fallback)
+
+            # list/tuple sometimes occurs due to upstream parsing bugs
+            if isinstance(x, (list, tuple)):
+                for e in x:
+                    if e is None:
+                        continue
+                    s = str(e).strip()
+                    if s:
+                        return s
+                return str(fallback)
+
+            s = str(x).strip()
+            return s if s else str(fallback)
+
         for ic in icecube_alerts:
             if hasattr(ic, "healpix_url"):
                 url = str(getattr(ic, "healpix_url"))
-                ic_id = str(getattr(ic, "event_name", "")).strip() or url.split("/")[-1]
+                fb = url.split("/")[-1]
+                ic_id = _normalize_ic_id(getattr(ic, "event_name", None), fb)
                 ic_alert_dt = getattr(ic, "alert_datetime", None)
             else:
                 url = ic["healpix_url"] if isinstance(ic, dict) else str(ic)
-                ic_id = (ic.get("event_name") if isinstance(ic, dict) else "") or url.split("/")[-1]
+                fb = url.split("/")[-1]
+                ic_id = _normalize_ic_id(ic.get("event_name") if isinstance(ic, dict) else None, fb)
                 ic_alert_dt = ic.get("alert_datetime") if isinstance(ic, dict) else None
 
-            pix_sets = select_pixels_sets(url, p_region=p_region, map_dir=map_dir, nest=nest)
+            pix_sets = select_pixels_sets(url, p_region=p_region, map_dir=map_dir)
 
             ic_jd = None
             if use_time:
@@ -1138,11 +1148,13 @@ class AmpelReportSet:
 
 
         def inside_pixsets(ra: float, dec: float, pix_sets: dict[int, set[int]]) -> bool:
+            """
+            Check if a given sky position (ra, dec) is inside a set of HEALPix pixels.
+            """
             lon = ra * u.deg
             lat = dec * u.deg
             for ns, pixels in pix_sets.items():
-                order = "nested" if nest else "ring"
-                ip = int(ah.lonlat_to_healpix(lon, lat, nside=int(ns), order=order))
+                ip = int(ah.lonlat_to_healpix(lon, lat, nside=int(ns), order="nested"))
                 if ip in pixels:
                     return True
             return False
@@ -1236,10 +1248,7 @@ class AmpelReportSet:
             If set, save figure to this path.
         """
 
-
-        # -------------------------
         # Collect LSST positions
-        # -------------------------
         reports = self.reports if use_all_reports else self.active_reports
         if not reports:
             raise RuntimeError("No reports to plot (empty active_reports/reports).")
@@ -1247,24 +1256,43 @@ class AmpelReportSet:
         ra_lsst = np.array([float(r.r.object.ra) for r in reports], dtype=float)
         dec_lsst = np.array([float(r.r.object.dec) for r in reports], dtype=float)
 
-        # -------------------------
+        
         # Helper: extract IC center
-        # -------------------------
         def _is_url(s: str) -> bool:
             return str(s).startswith("http://") or str(s).startswith("https://")
 
         def _download_to(url: str, out_dir: str) -> str:
+            """
+            Download URL to out_dir or return local path if already a file.
+
+            Notes
+            -----
+            - If `url` is a local existing file path, return it unchanged.
+            - If `url` is an http(s) URL, download it to out_dir and return the local path.
+            """
+            # local file path?
+            p = Path(str(url))
+            if p.exists() and p.is_file():
+                return str(p)
+
+            if not _is_url(str(url)):
+                raise ValueError(f"Not a URL and not an existing file: {url!r}")
+
             os.makedirs(out_dir, exist_ok=True)
-            fn = url.split("/")[-1]
+            fn = str(url).split("/")[-1]
             path = os.path.join(out_dir, fn)
-            r = requests.get(url, timeout=30)
+
+            r = requests.get(str(url), timeout=30)
             r.raise_for_status()
             with open(path, "wb") as f:
                 f.write(r.content)
             return path
 
         def _ic_center(alert: Any) -> tuple[float, float] | None:
-            # --- 1) raw dict fields (falls vorhanden)
+            """
+            Extract the center coordinates (ra, dec) from an alert.
+            """
+            # --- 1) raw dict fields (if available)
             if hasattr(alert, "raw"):
                 raw = getattr(alert, "raw")
                 if isinstance(raw, dict):
@@ -1283,22 +1311,22 @@ class AmpelReportSet:
                         except Exception:
                             pass
 
-            # --- 2) healpix_url -> lokal
+            # --- 2) healpix_url or path
             if hasattr(alert, "healpix_url"):
-                url = str(getattr(alert, "healpix_url"))
+                url_or_path = str(getattr(alert, "healpix_url"))
             elif isinstance(alert, dict) and "healpix_url" in alert:
-                url = str(alert["healpix_url"])
-            elif isinstance(alert, str) and _is_url(alert):
-                url = alert
+                url_or_path = str(alert["healpix_url"])
+            elif isinstance(alert, str):
+                url_or_path = str(alert)
             else:
                 return None
 
             try:
-                map_path = _download_to(url, map_dir)
+                map_path = _download_to(url_or_path, map_dir)
             except Exception:
                 return None
 
-            # --- 3) erst: Header-Keys probieren (optional)
+            # --- 3) Coordinates from header
             try:
                 hdr0 = fits.getheader(map_path)
                 for k_ra, k_dec in [("RA", "DEC"), ("RA_OBJ", "DEC_OBJ"), ("OBJRA", "OBJDEC")]:
@@ -1307,7 +1335,7 @@ class AmpelReportSet:
             except Exception:
                 pass
 
-            # --- 4) robust fallback für multiorder: Maximum der PROBDENSITY
+            # --- 4) robust fallback: Highest probability pixel
             try:
                 skymap = QTable.read(map_path)
                 if "PROBDENSITY" not in skymap.colnames or "UNIQ" not in skymap.colnames:
@@ -1335,9 +1363,7 @@ class AmpelReportSet:
                 if c is not None:
                     ic_points.append(c)
 
-        # -------------------------
-        # Plot Mollweide
-        # -------------------------
+        # CORE: Plot Mollweide
         fig = plt.figure(figsize=figsize, dpi=100)
         ax = plt.axes(
             [0.06, 0.08, 0.88, 0.86],
@@ -1409,15 +1435,24 @@ class AmpelReportSet:
         *,
         grid: bool = False,
         ncols: int = 3,
-        figsize: tuple = (15, 10),
+        figsize: tuple | None = (15, 10),
+        row_height: float = 3.2,
+        col_width: float = 5.0,
+        constrained: bool = True,
         **kwargs,
     ):
         """
         Plot lightcurves of active reports.
-        Use AmpelReport.plot_lightcurves() for every report.
+        Use AmpelReport.plot_lightcurve() for every report.
 
         grid=False: one plot per report (list of axes)
         grid=True:  single figure with grid layout (fig, axes)
+
+        Notes
+        -----
+        For large N, a fixed `figsize` will squeeze rows and can lead to overlapping.
+        If `figsize` is None, the height is scaled as (row_height * nrows) and
+        the width as (col_width * ncols).
         """
         reports = self.active_reports
         if not reports:
@@ -1431,7 +1466,12 @@ class AmpelReportSet:
 
         n = len(reports)
         nrows = math.ceil(n / ncols)
-        fig = plt.figure(figsize=figsize)
+
+        # Auto-figsize for large grids
+        if figsize is None:
+            figsize = (col_width * ncols, row_height * nrows)
+
+        fig = plt.figure(figsize=figsize, constrained_layout=bool(constrained))
         gs = GridSpec(nrows, ncols, figure=fig)
 
         axes = []
@@ -1441,12 +1481,17 @@ class AmpelReportSet:
             r.plot_lightcurve(ax=ax, **kwargs)
             axes.append(ax)
 
+        # turn off unused cells
         for j in range(i + 1, nrows * ncols):
             row, col = divmod(j, ncols)
             fig.add_subplot(gs[row, col]).axis("off")
 
-        fig.tight_layout()
+        # Avoid tight_layout with large grids; constrained_layout is more robust
+        if not constrained:
+            fig.tight_layout()
+
         return fig, axes
+
 
 
     def show_classifications(
@@ -1454,14 +1499,19 @@ class AmpelReportSet:
         *,
         grid: bool = False,
         ncols: int = 3,
-        figsize: tuple = (15, 10),
+        figsize: tuple | None = (15, 10),
+        row_height: float = 3.6,
+        col_width: float = 4.5,
+        threshold: float = 0.01,
+        constrained: bool = True,
     ):
         """
         Show classification diagrams of active reports.
-        Use AmpelReport.show_classifications() for every report.
+        Use AmpelReport.show_classification() for every report.
 
         grid=False: one radar per report
         grid=True:  radar plots in a grid
+
         """
         reports = self.active_reports
         if not reports:
@@ -1470,27 +1520,39 @@ class AmpelReportSet:
         if not grid:
             axes = []
             for r in reports:
-                axes.append(r.show_classification())
+                axes.append(r.show_classification(threshold=threshold))
             return axes
 
         n = len(reports)
         nrows = math.ceil(n / ncols)
-        fig = plt.figure(figsize=figsize)
+
+        if figsize is None:
+            figsize = (col_width * ncols, row_height * nrows)
+
+        fig = plt.figure(figsize=figsize, constrained_layout=bool(constrained))
         gs = GridSpec(nrows, ncols, figure=fig)
 
         axes = []
         for i, r in enumerate(reports):
             row, col = divmod(i, ncols)
             ax = fig.add_subplot(gs[row, col], projection="polar")
-            r.show_classification(ax=ax)
+            r.show_classification(ax=ax,threshold=threshold)
+            try:
+                name = r._display_name()
+            except Exception:
+                name = str(r.r.object.id)
+            ax.set_title(str(name), fontsize=9, pad=6)
             axes.append(ax)
 
         for j in range(i + 1, nrows * ncols):
             row, col = divmod(j, ncols)
             fig.add_subplot(gs[row, col]).axis("off")
 
-        fig.tight_layout()
+        if not constrained:
+            fig.tight_layout()
+
         return fig, axes
+
 
 
     def show_hosts(
@@ -1498,7 +1560,12 @@ class AmpelReportSet:
         *,
         grid: bool = False,
         ncols: int = 2,
-        figsize: tuple = (16, 6),
+        figsize: tuple | None = (16, 6),
+        row_height: float = 3.4,
+        col_width: float = 8.0,
+        constrained: bool = True,
+        hspace: float = 0.25,
+        wspace: float = 0.15,
     ):
         """
         Show host / object information of active reports.
@@ -1506,6 +1573,12 @@ class AmpelReportSet:
 
         grid=False: one figure per report
         grid=True:  host info arranged in a grid (subfigures)
+
+        Notes
+        -----
+        For large N, a fixed `figsize` will squeeze rows and can lead to overlapping.
+        If `figsize` is None, the height is scaled as (row_height * nrows) and
+        the width as (col_width * ncols).
         """
         reports = self.active_reports
         if not reports:
@@ -1519,16 +1592,29 @@ class AmpelReportSet:
 
         n = len(reports)
         nrows = math.ceil(n / ncols)
-        fig = plt.figure(figsize=figsize)
-        outer = GridSpec(nrows, ncols, figure=fig)
+
+        if figsize is None:
+            figsize = (col_width * ncols, row_height * nrows)
+
+        fig = plt.figure(figsize=figsize, constrained_layout=bool(constrained))
+        outer = GridSpec(
+            nrows,
+            ncols,
+            figure=fig,
+            hspace=hspace,
+            wspace=wspace,
+        )
 
         for i, r in enumerate(reports):
             row, col = divmod(i, ncols)
             subfig = fig.add_subfigure(outer[row, col])
             r.show_hostinfo(fig=subfig)
 
-        fig.tight_layout()
+        if not constrained:
+            fig.tight_layout()
+
         return fig
+
 
 
 
