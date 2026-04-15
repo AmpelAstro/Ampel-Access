@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Optional, Any
 import io
 import requests
+import math
 
 import numpy as np
 import pandas as pd
@@ -55,14 +56,16 @@ def get_finder_stamp(
     fov_arcsec: float = 45.0,
 ) -> tuple[np.ndarray | None, str | None]:
     """
-    Best-effort finder stamp: CDS hips2fits JPEG
+    Download a finder stamp centered at the given RA and Dec.
 
-    Returns (image_array, label). image_array is 2D float array or None.
+    The stamp is fetched from CDS HiPS services as a JPEG image and returned
+    as an RGB numpy array together with a survey label.
     """
 
     if surveys is None:
         surveys = [
             "CDS/P/DESI-Legacy-Surveys/DR10/color",
+            "CDS/P/PanSTARRS/DR1/color-z-zg-g",
             "CDS/P/DECaLS/DR5/color",
             "CDS/P/DES-DR2/ColorIRG",
             "CDS/P/Skymapper/DR4/color",
@@ -71,15 +74,16 @@ def get_finder_stamp(
 
     labels = {
         "CDS/P/DESI-Legacy-Surveys/DR10/color": "DESI DR10",
+        "CDS/P/PanSTARRS/DR1/color-z-zg-g": "PS1",
+        "CDS/P/DECaLS/DR5/color": "DECaLS",
         "CDS/P/DES-DR2/ColorIRG": "DES",
         "CDS/P/Skymapper/DR4/color": "SkyMapper",
-        "CDS/P/DECaLS/DR5/color": "DECaLS",
         "CDS/P/DSS2/color": "DSS2",
     }
 
-    BASE_URLS = [
-    "https://alasky.cds.unistra.fr/hips-image-services/hips2fits",
-    "https://alaskybis.cds.unistra.fr/hips-image-services/hips2fits",
+    base_urls = [
+        "https://alasky.cds.unistra.fr/hips-image-services/hips2fits",
+        "https://alaskybis.cds.unistra.fr/hips-image-services/hips2fits",
     ]
 
     fov_deg = float(fov_arcsec) / 3600.0
@@ -101,57 +105,32 @@ def get_finder_stamp(
                 "format": "jpg",
                 "projection": "TAN",
             }
-            for base_url in BASE_URLS:
-                r = requests.get(base_url, params=params, timeout=timeout)
 
-            if r.status_code != 200 or not r.content:
+            response = None
+            for base_url in base_urls:
+                try:
+                    trial = requests.get(base_url, params=params, timeout=timeout)
+                except Exception:
+                    continue
+
+                if trial.status_code == 200 and trial.content:
+                    response = trial
+                    break
+
+            if response is None:
                 continue
 
-            img = Image.open(io.BytesIO(r.content))
+            img = Image.open(io.BytesIO(response.content))
             img = ImageOps.exif_transpose(img).convert("RGB")
-            arr = np.asarray(img).astype(float)
-
-            # RGB -> grayscale [0,1]
-            arr = 0.2126 * arr[..., 0] + 0.7152 * arr[..., 1] + 0.0722 * arr[..., 2]
-            arr /= 255.0
+            arr = np.asarray(img).astype(float) / 255.0
 
             return arr, labels.get(hips, hips)
 
-        except Exception as e:
-            print(f"[finder] hips={hips} failed: {type(e).__name__}: {e}")
+        except Exception:
             continue
 
     return None, None
 
-
-def normalize_image_for_imshow(arr: np.ndarray) -> np.ndarray:
-    """
-    Normalize an image array to the range [0,1] for display with imshow.
-
-    The image array is assumed to be in one of the following formats:
-    - 2D grayscale image
-    - 3D RGB image, either as (height, width, 3) or (3, height, width)
-    - 3D RGBA image, either as (height, width, 4) or (4, height, width)
-
-    If the image array has an unsupported shape, a TypeError is raised.
-    """
-    a = np.asarray(arr)
-
-    if a.ndim == 2:
-        return a
-
-    if a.ndim == 3 and a.shape[2] in (3, 4):
-        rgb = a[..., :3].astype(float)
-        return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
-
-    if a.ndim == 3 and a.shape[0] in (3, 4):
-        rgb = a[:3, ...].astype(float)
-        return 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
-
-    if a.ndim == 3:
-        return a[0, ...] if a.shape[0] < a.shape[-1] else a[..., 0]
-
-    raise TypeError(f"Unsupported stamp shape for imshow: {a.shape}")
 
 def add_gap_crosshair(
     ax, *, gap_frac: float = 0.2, lw: float = 1.0, alpha: float = 0.8
@@ -273,6 +252,102 @@ def create_classprob_radar(
         return ax
 
 # ------------------------------------------------------------
+# Rolling stacking of datapoints
+# ------------------------------------------------------------
+
+def stack_photometry_rolling(
+    df: pd.DataFrame,
+    *,
+    window_hours: float = 2.0,
+) -> pd.DataFrame:
+    """
+    Rolling binning within each band: consecutive points are stacked as long as
+    the time gap to the previous point is <= window_hours.
+
+    Stacking is performed in flux space using inverse-variance weights.
+    time and zp are also weighted by the same weights if available.
+
+    Returns a new DataFrame with at least:
+    time, flux, fluxerr, band, zp
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    dt_max = float(window_hours) / 24.0  # hours -> days
+
+    out_rows: list[dict[str, Any]] = []
+
+    for band in sorted(df["band"].dropna().astype(str).unique()):
+        tab = df.loc[df["band"].astype(str) == band].copy()
+        if len(tab) == 0:
+            continue
+
+        t = pd.to_numeric(tab["time"], errors="coerce").to_numpy(dtype=float)
+        f = pd.to_numeric(tab["flux"], errors="coerce").to_numpy(dtype=float)
+        fe = pd.to_numeric(tab["fluxerr"], errors="coerce").to_numpy(dtype=float)
+
+        if "zp" in tab.columns:
+            zps = pd.to_numeric(tab["zp"], errors="coerce").to_numpy(dtype=float)
+        else:
+            zps = np.full(len(tab), np.nan, dtype=float)
+
+        idx = np.argsort(t)
+        t = t[idx]
+        f = f[idx]
+        fe = fe[idx]
+        zps = zps[idx]
+
+        start = 0
+        n = len(t)
+
+        while start < n:
+            end = start + 1
+            while end < n and (t[end] - t[end - 1]) <= dt_max:
+                end += 1
+
+            tt = t[start:end]
+            ff = f[start:end]
+            ee = fe[start:end]
+            zz = zps[start:end]
+
+            w = np.zeros_like(ee, dtype=float)
+            ok = np.isfinite(tt) & np.isfinite(ff) & np.isfinite(ee) & (ee > 0)
+            w[ok] = 1.0 / (ee[ok] ** 2)
+
+            if np.sum(w) <= 0:
+                t_mean = float(np.nanmean(tt))
+                f_mean = float(np.nanmean(ff))
+                if np.sum(np.isfinite(ff)) > 1:
+                    f_err = float(np.nanstd(ff) / np.sqrt(np.sum(np.isfinite(ff))))
+                else:
+                    f_err = float("nan")
+                zp_mean = float(np.nanmean(zz)) if np.any(np.isfinite(zz)) else 31.4
+            else:
+                wsum = float(np.sum(w))
+                t_mean = float(np.sum(w * tt) / wsum)
+                f_mean = float(np.sum(w * ff) / wsum)
+                f_err = float(np.sqrt(1.0 / wsum))
+                zp_mean = (
+                    float(np.sum(w * zz) / wsum)
+                    if np.any(np.isfinite(zz))
+                    else 31.4
+                )
+
+            out_rows.append(
+                {
+                    "time": t_mean,
+                    "flux": f_mean,
+                    "fluxerr": f_err,
+                    "band": str(band),
+                    "zp": zp_mean,
+                }
+            )
+
+            start = end
+
+    return pd.DataFrame.from_records(out_rows)
+
+# ------------------------------------------------------------
 # Small Helper
 # ------------------------------------------------------------
 
@@ -305,6 +380,7 @@ BANDINFO = {
 }
 
 
+
 class AmpelTransientReport():
     """
     Convenience wrapper around an `LSSTReport` for visualization and inspection.
@@ -333,7 +409,7 @@ class AmpelTransientReport():
     # Inspect the Report
     # ------------------------------------------------------------
 
-    def create_table(self, backup_zp=31.4):
+    def create_table(self, backup_zp: float = 31.4):
         """
         Convert existing list of Photometric Points to pandas table.
 
@@ -349,17 +425,32 @@ class AmpelTransientReport():
             self.phot_table = None
             return
 
-        # pydantic objects -> list[dict] for DataFrame
         rows = [p.model_dump() for p in self.r.photometry]
-        self.phot_table = pd.DataFrame.from_records(rows)
+        df = pd.DataFrame.from_records(rows)
 
+        for col in ("time", "flux", "fluxerr"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # If phot points use different zeropoints, shift to backup value.
-        if len(set(self.phot_table["zp"]))>1:
-            scaling = 10**( 2.5* ( backup_zp - self.phot_table["zp"] ) )
-            self.phot_table['flux'] *= scaling
-            self.phot_table['fluxerr'] *= scaling
-            self.phot_table['zp'] = backup_zp
+        if "band" in df.columns:
+            df["band"] = df["band"].astype(str)
+
+        if "zp" not in df.columns:
+            df["zp"] = float(backup_zp)
+        else:
+            df["zp"] = pd.to_numeric(df["zp"], errors="coerce")
+            df["zp"] = df["zp"].fillna(float(backup_zp))
+
+        # Rescale all fluxes to a common zeropoint if needed
+        # mag = -2.5 log10(flux) + zp  must remain invariant
+        # => flux_new = flux_old * 10**(0.4 * (zp_old - zp_new))
+        if len(set(np.round(df["zp"].to_numpy(dtype=float), 8))) > 1:
+            scale = 10 ** (0.4 * (df["zp"].astype(float) - float(backup_zp)))
+            df["flux"] = df["flux"].astype(float) * scale
+            df["fluxerr"] = df["fluxerr"].astype(float) * scale
+            df["zp"] = float(backup_zp)
+
+        self.phot_table = df
 
     
     def to_summary_dict(
@@ -574,22 +665,30 @@ class AmpelTransientReport():
     # Finder stamp (Thumbnails)
     # ------------------------------------------------------------
     
-    def get_catalogimage(self, surveys: Optional[list[str]] = None):
+    def get_catalogimage(
+        self,
+        surveys: Optional[list[str]] = None,
+        fov_arcsec: float = 22.0,
+    ):
         """
         Load a catalog thumbnail from CDS by using the helper functions.
+        Default FOV matches the no-cutout finder layout from PlotTransientLightcurves.
         """
 
         stamp, stamp_label = get_finder_stamp(
-            ra=self.r.object.ra, dec=self.r.object.dec, 
-            size=240, fov_arcsec=60.0, surveys = surveys
+            ra=self.r.object.ra,
+            dec=self.r.object.dec,
+            size=240,
+            fov_arcsec=fov_arcsec,
+            surveys=surveys,
         )
+
         if stamp is None:
-            # Set to -1 to indicate we tried but failed
-            self.catalog_thumbnail = {'stamp':-1, 'label':'fail'}
+            self.catalog_thumbnail = {"stamp": -1, "label": "fail"}
         else:
             self.catalog_thumbnail = {
-                'stamp':normalize_image_for_imshow(stamp), 
-                'label':stamp_label
+                "stamp": stamp,
+                "label": stamp_label,
             }
 
     # ------------------------------------------------------------
@@ -844,14 +943,21 @@ class AmpelTransientReport():
         stamp = self.catalog_thumbnail.get("stamp")
 
         if isinstance(stamp, np.ndarray):
-            ax_img.imshow(stamp, cmap="gray")
-            add_gap_crosshair(ax_img, gap_frac=0.2, lw=1.0, alpha=0.9)
+            ax_img.imshow(stamp, aspect="equal", origin="upper")
+            add_gap_crosshair(ax_img, gap_frac=0.333, lw=1.0, alpha=0.9)
             ax_img.set_title(self.catalog_thumbnail.get("label", "Finder"), fontsize=11)
             ax_img.set_xticks([])
             ax_img.set_yticks([])
         else:
             ax_img.axis("off")
-            ax_img.text(0.5, 0.5, "Finder unavailable", ha="center", va="center", fontsize="small")
+            ax_img.text(
+                0.5,
+                0.5,
+                "Finder unavailable",
+                ha="center",
+                va="center",
+                fontsize="small",
+            )
 
 
         return fig
@@ -884,18 +990,23 @@ class AmpelTransientReport():
         sigma_limit: Optional[float] = None,
         ax: Optional[Axes] = None,
         use_mag: bool = True,
+        stacking: bool = True,
+        stacking_window_hours: float = 2.0,
+        stacking_alpha: float = 0.22,
         **kwargs
     ) -> Axes:
         """
         Plot photometric light curve.
 
         bands: Filter bands to plot
-        t_lim: Min and max JD time to plot.
-        max_tago: Only include t_ago days past now.
-        sigma_limit: Only plot detections above this threshold.
+        t_lim: Min and max JD time to plot
+        max_tago: Only include t_ago days past now
+        sigma_limit: Only plot detections above this threshold
         ax: Existing matplotlib axes
         use_mag: Plot magnitudes instead of fluxes
-        **kwargs: Additional arguments passed to matplotlib errorbar
+        stacking: If True, stack nearby points per band in flux space
+        stacking_window_hours: Max gap between consecutive points in one stack
+        stacking_alpha: Alpha for raw background points when stacking=True
         """
 
         if ax is None:
@@ -909,13 +1020,15 @@ class AmpelTransientReport():
             ax.set_axis_off()
             return ax
 
-        df = self.phot_table
+        raw_df = self.phot_table.copy()
 
         if bands is None:
-            bands = set(df["band"])
+            bands = sorted(set(raw_df["band"].astype(str)))
 
         if t_lim is None:
-            t_lim = [df["time"].min(), df["time"].max()]
+            t_lim = [float(raw_df["time"].min()), float(raw_df["time"].max())]
+        else:
+            t_lim = [float(t_lim[0]), float(t_lim[1])]
 
         if max_tago is not None:
             t_lim[0] = Time.now().jd - max_tago
@@ -923,45 +1036,124 @@ class AmpelTransientReport():
         if sigma_limit is None:
             sigma_limit = 0.0
 
-        if use_mag:
-            # keep only positive fluxes
-            pos = df["flux"].astype(float) > 0
-            df = df.loc[pos].copy()
+        def _prepare_plot_df(df_in: pd.DataFrame) -> pd.DataFrame:
+            df = df_in.copy()
 
-            if len(df) == 0:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No positive flux points",
-                    ha="center",
-                    va="center",
-                )
-                ax.set_axis_off()
-                return ax
+            df["time"] = pd.to_numeric(df["time"], errors="coerce")
+            df["flux"] = pd.to_numeric(df["flux"], errors="coerce")
+            df["fluxerr"] = pd.to_numeric(df["fluxerr"], errors="coerce")
+            df["zp"] = pd.to_numeric(df.get("zp", 31.4), errors="coerce").fillna(31.4)
+            df["band"] = df["band"].astype(str)
 
-            # per-point zp preferred; fallback
-            if "zp" not in df.columns:
-                df["zp"] = 31.4
+            df = df.dropna(subset=["time", "flux", "fluxerr", "zp", "band"])
 
-            df["mag"] = -2.5 * np.log10(df["flux"].astype(float)) + df["zp"].astype(float)
-            df["magerr"] = np.abs(
-                -2.5 * df["fluxerr"].astype(float)
-                / (df["flux"].astype(float) * np.log(10))
+            if use_mag:
+                df = df.loc[df["flux"] > 0].copy()
+                if len(df) == 0:
+                    return df
+
+                flux = df["flux"].to_numpy(dtype=float)
+                fluxerr = df["fluxerr"].to_numpy(dtype=float)
+                zp = df["zp"].to_numpy(dtype=float)
+
+                mag = -2.5 * np.log10(flux) + zp
+
+                flux_plus = flux + fluxerr
+                flux_minus = flux - fluxerr
+
+                mag_plus = np.full_like(flux, np.nan, dtype=float)
+                mag_minus = np.full_like(flux, np.nan, dtype=float)
+
+                ok_plus = flux_plus > 0
+                ok_minus = flux_minus > 0
+
+                mag_plus[ok_plus] = -2.5 * np.log10(flux_plus[ok_plus]) + zp[ok_plus]
+                mag_minus[ok_minus] = -2.5 * np.log10(flux_minus[ok_minus]) + zp[ok_minus]
+
+                df["mag"] = mag
+                df["magerrmin"] = mag - mag_plus
+                df["magerrmax"] = mag_minus - mag
+
+            snr = np.abs(df["flux"].to_numpy(dtype=float)) / df["fluxerr"].to_numpy(dtype=float)
+            df["snr"] = snr
+
+            return df
+
+        raw_plot_df = _prepare_plot_df(raw_df)
+
+        if stacking:
+            stacked_df = stack_photometry_rolling(
+                raw_df,
+                window_hours=stacking_window_hours,
             )
+            plot_df = _prepare_plot_df(stacked_df)
+        else:
+            plot_df = raw_plot_df
 
-        # Signal-to-noise for filtering
-        snr = np.abs(df["flux"].astype(float)) / df["fluxerr"].astype(float)
+        if len(plot_df) == 0:
+            ax.text(
+                0.5,
+                0.5,
+                "No positive flux points" if use_mag else "No usable photometry",
+                ha="center",
+                va="center",
+            )
+            ax.set_axis_off()
+            return ax
 
         for band in bands:
             if band not in BANDINFO:
                 print(f"Warning: band {band} not in BANDINFO, skipping")
                 continue
 
+            # Raw background points
+            if stacking and len(raw_plot_df) > 0:
+                raw_mask = (
+                    (raw_plot_df["time"] > t_lim[0]) &
+                    (raw_plot_df["time"] < t_lim[1]) &
+                    (raw_plot_df["band"] == band) &
+                    (raw_plot_df["snr"] > sigma_limit)
+                )
+
+                if np.any(raw_mask):
+                    if use_mag:
+                        ax.errorbar(
+                            raw_plot_df.loc[raw_mask, "time"],
+                            raw_plot_df.loc[raw_mask, "mag"],
+                            yerr=[
+                                raw_plot_df.loc[raw_mask, "magerrmin"],
+                                raw_plot_df.loc[raw_mask, "magerrmax"],
+                            ],
+                            fmt=".",
+                            markersize=6,
+                            color=BANDINFO[band]["c"],
+                            alpha=float(stacking_alpha),
+                            mec="black",
+                            mew=0.3,
+                            label=None,
+                            zorder=1,
+                        )
+                    else:
+                        ax.errorbar(
+                            raw_plot_df.loc[raw_mask, "time"],
+                            raw_plot_df.loc[raw_mask, "flux"],
+                            yerr=raw_plot_df.loc[raw_mask, "fluxerr"],
+                            fmt=".",
+                            markersize=6,
+                            color=BANDINFO[band]["c"],
+                            alpha=float(stacking_alpha),
+                            mec="black",
+                            mew=0.3,
+                            label=None,
+                            zorder=1,
+                        )
+
+            # Foreground stacked / normal points
             mask = (
-                (df["time"] > t_lim[0]) &
-                (df["time"] < t_lim[1]) &
-                (df["band"] == band) &
-                (snr > sigma_limit)
+                (plot_df["time"] > t_lim[0]) &
+                (plot_df["time"] < t_lim[1]) &
+                (plot_df["band"] == band) &
+                (plot_df["snr"] > sigma_limit)
             )
 
             if not np.any(mask):
@@ -969,44 +1161,74 @@ class AmpelTransientReport():
 
             if use_mag:
                 ax.errorbar(
-                    df.loc[mask, "time"],
-                    df.loc[mask, "mag"],
-                    yerr=df.loc[mask, "magerr"],
-                    fmt="o",
+                    plot_df.loc[mask, "time"],
+                    plot_df.loc[mask, "mag"],
+                    yerr=[
+                        plot_df.loc[mask, "magerrmin"],
+                        plot_df.loc[mask, "magerrmax"],
+                    ],
+                    fmt="o" if not stacking else ".",
                     label=BANDINFO[band]["label"],
-                    markersize=5,
+                    markersize=7 if not stacking else 11,
                     color=BANDINFO[band]["c"],
+                    mec="black" if stacking else None,
+                    mew=0.7 if stacking else None,
+                    zorder=2,
                     **kwargs,
                 )
             else:
                 ax.errorbar(
-                    df.loc[mask, "time"],
-                    df.loc[mask, "flux"],
-                    yerr=df.loc[mask, "fluxerr"],
-                    fmt="o",
+                    plot_df.loc[mask, "time"],
+                    plot_df.loc[mask, "flux"],
+                    yerr=plot_df.loc[mask, "fluxerr"],
+                    fmt="o" if not stacking else ".",
                     label=BANDINFO[band]["label"],
-                    markersize=5,
+                    markersize=7 if not stacking else 11,
                     color=BANDINFO[band]["c"],
+                    mec="black" if stacking else None,
+                    mew=0.7 if stacking else None,
+                    zorder=2,
                     **kwargs,
                 )
 
-        # Labels & cosmetics
-        ax.legend(fontsize="small")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=10)
 
-        ax.set_xlabel("Time (JD)")
+        ax.set_xlabel("Time (JD)", fontsize=11)
 
         if use_mag:
-            ax.set_ylabel("Magnitude [AB]")
+            ax.set_ylabel("Magnitude [AB]", fontsize=11)
             ax.invert_yaxis()
         else:
-            ax.set_ylabel(f"Flux (zp {self.phot_table['zp'][0]})")
+            ax.set_ylabel(f"Flux (zp {self.phot_table['zp'][0]})", fontsize=11)
 
-        # robust title (avoid "None (id)")
+        ax.tick_params(axis="both", labelsize=10)
+            
+        if use_mag and len(plot_df) > 0:
+            ylim_mask = (
+                (plot_df["time"] > t_lim[0]) &
+                (plot_df["time"] < t_lim[1]) &
+                (plot_df["band"].isin(bands)) &
+                (plot_df["snr"] > sigma_limit) &
+                np.isfinite(plot_df["mag"])
+            )
+
+        if np.any(ylim_mask):
+            mags = plot_df.loc[ylim_mask, "mag"].to_numpy(dtype=float)
+            max_mag = float(np.max(mags) + 0.3)
+            min_mag = float(np.min(mags) - 0.3)
+            ax.set_ylim((max_mag, min_mag))
+
         name = self._display_name()
         obj_id = str(self.r.object.id)
         z = self.r.host[0].redshift if len(self.r.host) > 0 and self.r.host[0].redshift is not None else None
         z_txt = f"{float(z):.2f}" if z is not None else "?"
-        ax.set_title(f"ID: {name} ({obj_id})  z: {z_txt}" if str(name)!=obj_id else f"ID: {name}  z: {z_txt}")
+        ax.set_title(
+            f"ID: {name} ({obj_id})  z: {z_txt}"
+            if str(name) != obj_id
+            else f"ID: {name}  z: {z_txt}"
+        )
 
         ax.grid(True, alpha=0.3)
 
